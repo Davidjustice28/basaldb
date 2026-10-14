@@ -30,6 +30,11 @@ Users[7#1] parent=3 children=[] "Elena" "elena@acme.io"
 > language may still change. Don't use it for data you can't afford to
 > lose. In particular, **don't let several processes write to the same
 > file at once** ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+>
+> **Performance:** comfortable up to about 50k records per file today.
+> Beyond that, most operations slow down as the file grows. See
+> [BENCHMARKS.md](BENCHMARKS.md) and the
+> [scalability roadmap (#42)](https://github.com/Davidjustice28/basildb/issues/42).
 
 ---
 
