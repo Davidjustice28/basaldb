@@ -24,15 +24,17 @@ var (
 	ErrBranchTaken = errors.New("engine: branch already exists")
 )
 
-// TxMeta carries the mandatory audit metadata recorded with every commit
-// and branch event.
+// TxMeta carries the audit metadata recorded with every commit and
+// branch event. It is required for structural operations (container
+// initialization, branch creation) and optional for record writes,
+// where it stamps the commit block when present.
 type TxMeta struct {
 	Author  string `json:"author"`
 	Summary string `json:"summary"`
 	Reason  string `json:"reason"`
 }
 
-// Validate enforces the mandatory audit fields.
+// Validate enforces the audit fields for structural operations.
 func (m TxMeta) Validate() error {
 	if strings.TrimSpace(m.Author) == "" {
 		return errors.New("engine: Author is required")
@@ -779,12 +781,11 @@ type WriteTx struct {
 }
 
 // Begin starts a write transaction on top of the branch head snapshot.
+// Record writes do not require audit metadata; whatever TxMeta carries
+// stamps the resulting commit block.
 func (db *DB) Begin(branch string, meta TxMeta) (*WriteTx, error) {
 	if branch == "" {
 		branch = DefaultBranch
-	}
-	if err := meta.Validate(); err != nil {
-		return nil, err
 	}
 	base, err := db.Snapshot(branch)
 	if err != nil {
@@ -930,9 +931,6 @@ func (tx *WriteTx) Children(layerName string, id uint64) ([]*Record, error) {
 // Commit fails with ErrConflict instead of silently losing the update.
 func (tx *WriteTx) Commit() (*Snapshot, error) {
 	if err := tx.check(); err != nil {
-		return nil, err
-	}
-	if err := tx.meta.Validate(); err != nil {
 		return nil, err
 	}
 	db := tx.db

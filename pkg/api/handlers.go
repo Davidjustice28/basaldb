@@ -121,8 +121,9 @@ type executeBody struct {
 	Reason    string `json:"reason"`
 }
 
-// handleExecute runs any BQL statement. Writes require the mandatory audit
-// metadata (author, summary, reason) and append an immutable commit block.
+// handleExecute runs any BQL statement. Record writes are metadata-free
+// (whatever the body carries stamps the commit block); BRANCH CREATE
+// requires the audit metadata.
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, errors.New("POST only"))

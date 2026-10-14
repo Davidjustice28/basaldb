@@ -6,8 +6,9 @@ import (
 	"strings"
 )
 
-// Commit is one immutable commit block in the .bsl audit trail. Every commit
-// carries mandatory Author, Summary, and Reason metadata.
+// Commit is one immutable commit block in the .bsl audit trail. Author,
+// Summary and Reason stamp the block when provided; they are mandatory
+// only on structural entries (initialization, branch events).
 type Commit struct {
 	ID        uint64   `json:"id"`
 	Branch    string   `json:"branch"`
@@ -45,17 +46,11 @@ func (e LogEntry) Meta() (author, summary, reason string) {
 	return e.Branch.Author, e.Branch.Summary, e.Branch.Reason
 }
 
-// Validate enforces the mandatory commit metadata.
+// Validate checks the structural fields of a commit. The audit
+// metadata (Author, Summary, Reason) is optional: record writes may
+// carry none, and it is enforced only where it is mandatory (container
+// initialization, branch creation).
 func (c *Commit) Validate() error {
-	if strings.TrimSpace(c.Author) == "" {
-		return fmt.Errorf("engine: commit %d requires Author", c.ID)
-	}
-	if strings.TrimSpace(c.Summary) == "" {
-		return fmt.Errorf("engine: commit %d requires Summary", c.ID)
-	}
-	if strings.TrimSpace(c.Reason) == "" {
-		return fmt.Errorf("engine: commit %d requires Reason", c.ID)
-	}
 	if strings.TrimSpace(c.Branch) == "" {
 		return fmt.Errorf("engine: commit %d requires Branch", c.ID)
 	}
@@ -128,7 +123,8 @@ func LogRegionText(entries []LogEntry) string {
 }
 
 // ParseLogRegion parses the human-readable commit log region into ordered
-// entries. Author, Summary, and Reason are mandatory on every entry.
+// entries. Author, Summary, and Reason stamp each entry when provided
+// and are mandatory on structural entries (initialization, branches).
 func ParseLogRegion(region []byte) ([]LogEntry, error) {
 	text := strings.ReplaceAll(string(region), "\r\n", "\n")
 	if strings.TrimSpace(text) == "" {

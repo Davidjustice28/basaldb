@@ -126,17 +126,45 @@ func TestCascadeDeleteWritesImmutableCommitLog(t *testing.T) {
 	}
 }
 
-func TestCommitRequiresMandatoryMetadata(t *testing.T) {
+// Record writes are metadata-free: Begin accepts any TxMeta and the
+// commit carries exactly what it was given. Structural operations
+// (container Init, CreateBranch) still require the full audit metadata.
+func TestRecordWritesAcceptAnyMetadata(t *testing.T) {
 	db := openTestDB(t)
 	for _, meta := range []TxMeta{
+		{},
 		{Author: "", Summary: "s", Reason: "r"},
 		{Author: "a", Summary: "", Reason: "r"},
 		{Author: "a", Summary: "s", Reason: ""},
 		{Author: "   ", Summary: "s", Reason: "r"},
 	} {
-		if _, err := db.Begin(DefaultBranch, meta); err == nil {
-			t.Errorf("Begin accepted metadata %+v", meta)
+		tx, err := db.Begin(DefaultBranch, meta)
+		if err != nil {
+			t.Fatalf("Begin(%+v): %v", meta, err)
 		}
+		if _, err := tx.Create("Accounts", 0, []string{"x"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		snap, err := tx.Commit()
+		if err != nil {
+			t.Fatalf("Commit(%+v): %v", meta, err)
+		}
+		c, ok := db.Commit(snap.Commit)
+		if !ok {
+			t.Fatalf("commit %d missing from the audit trail", snap.Commit)
+		}
+		if c.Author != meta.Author || c.Summary != meta.Summary || c.Reason != meta.Reason {
+			t.Errorf("commit %+v, want %+v", c, meta)
+		}
+	}
+
+	// Structural operations still require the full metadata.
+	if _, err := Init(t.TempDir()+"/meta.bsl",
+		[]Layer{{Height: 0, Name: "Accounts"}}, TxMeta{Author: "a"}); err == nil {
+		t.Error("Init without full metadata succeeded")
+	}
+	if err := db.CreateBranch("no-meta", DefaultBranch, TxMeta{Author: "a"}); err == nil {
+		t.Error("CreateBranch without full metadata succeeded")
 	}
 }
 

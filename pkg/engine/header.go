@@ -35,9 +35,28 @@ var (
 )
 
 // Layer is one Y-axis height of the matrix: a named level of the hierarchy.
+// Attrs optionally declares the layer's attribute names (Z axis, in
+// positional order) so queries can reference attributes symbolically:
+//
+//	Layers:[0:Accounts(name,date), 1:Teams(name)]
+//
+// Files written before attribute declarations existed simply have none.
 type Layer struct {
-	Height int    `json:"height"`
-	Name   string `json:"name"`
+	Height int      `json:"height"`
+	Name   string   `json:"name"`
+	Attrs  []string `json:"attrs,omitempty"`
+}
+
+// AttrIndex resolves a declared attribute name to its positional
+// index. Matching is case-insensitive, so [Name], [name] and [NAME]
+// all reference the same column.
+func (l Layer) AttrIndex(name string) (int, bool) {
+	for i, a := range l.Attrs {
+		if strings.EqualFold(a, name) {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // Header is the parsed ASCII header block of a .bsl file. It declares the
@@ -164,8 +183,98 @@ func ParseHeader(block []byte) (*Header, error) {
 	return h, nil
 }
 
-// parseLayers parses "​[0:Accounts, 1:Teams, 2:Users]​" into a map keyed by
-// layer height (Y axis).
+// ParseLayers parses a layer specification used by the CLI flags and the
+// header's Layers entry list: comma-separated entries of the form
+//
+//	[Height:]Name[(attr,attr,...)]
+//
+// Height defaults to the entry position. Examples:
+//
+//	0:Accounts(name,date),1:Teams(name),2:Users(name,email)
+//	Accounts,Teams,Users
+func ParseLayers(spec string) ([]Layer, error) {
+	var out []Layer
+	for i, part := range splitTopLevel(spec, ',') {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		height, def := i, part
+		if hStr, rest, ok := strings.Cut(part, ":"); ok {
+			h, err := strconv.Atoi(strings.TrimSpace(hStr))
+			if err != nil {
+				return nil, fmt.Errorf("engine: bad layer definition %q", part)
+			}
+			height, def = h, rest
+		}
+		name, attrs, err := parseLayerDef(def)
+		if err != nil {
+			return nil, fmt.Errorf("engine: bad layer definition %q: %w", part, err)
+		}
+		if name == "" {
+			return nil, fmt.Errorf("engine: empty layer name for height %d", height)
+		}
+		for _, l := range out {
+			if l.Height == height {
+				return nil, fmt.Errorf("engine: duplicate layer height %d", height)
+			}
+		}
+		out = append(out, Layer{Height: height, Name: name, Attrs: attrs})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("engine: no layers given")
+	}
+	return out, nil
+}
+
+// splitTopLevel splits s on sep, ignoring separators nested in
+// parentheses ("0:Accounts(name,date)" stays one entry).
+func splitTopLevel(s string, sep byte) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case sep:
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, s[start:])
+}
+
+// parseLayerDef splits "Accounts(name,date)" into its name and declared
+// attribute names.
+func parseLayerDef(def string) (string, []string, error) {
+	def = strings.TrimSpace(def)
+	open := strings.IndexByte(def, '(')
+	if open < 0 {
+		return def, nil, nil
+	}
+	if !strings.HasSuffix(def, ")") {
+		return "", nil, fmt.Errorf("unterminated attribute list")
+	}
+	name := strings.TrimSpace(def[:open])
+	var attrs []string
+	for _, a := range splitTopLevel(def[open+1:len(def)-1], ',') {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			return "", nil, fmt.Errorf("empty attribute name")
+		}
+		attrs = append(attrs, a)
+	}
+	return name, attrs, nil
+}
+
+// parseLayers parses "​[0:Accounts(name,date), 1:Teams]​" into a map
+// keyed by layer height (Y axis).
 func parseLayers(value string) (map[int]Layer, error) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "[") || !strings.HasSuffix(value, "]") {
@@ -176,9 +285,9 @@ func parseLayers(value string) (map[int]Layer, error) {
 	if inner == "" {
 		return layers, nil
 	}
-	for _, part := range strings.Split(inner, ",") {
+	for _, part := range splitTopLevel(inner, ',') {
 		part = strings.TrimSpace(part)
-		heightStr, name, ok := strings.Cut(part, ":")
+		heightStr, def, ok := strings.Cut(part, ":")
 		if !ok {
 			return nil, fmt.Errorf("%w: malformed layer entry %q", ErrCorruptHeader, part)
 		}
@@ -186,14 +295,17 @@ func parseLayers(value string) (map[int]Layer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: malformed layer height %q", ErrCorruptHeader, heightStr)
 		}
-		name = strings.TrimSpace(name)
+		name, attrs, err := parseLayerDef(def)
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed layer entry %q: %v", ErrCorruptHeader, part, err)
+		}
 		if name == "" {
 			return nil, fmt.Errorf("%w: empty layer name for height %d", ErrCorruptHeader, height)
 		}
 		if _, dup := layers[height]; dup {
 			return nil, fmt.Errorf("%w: duplicate layer height %d", ErrCorruptHeader, height)
 		}
-		layers[height] = Layer{Height: height, Name: name}
+		layers[height] = Layer{Height: height, Name: name, Attrs: attrs}
 	}
 	return layers, nil
 }
@@ -212,6 +324,16 @@ func (h *Header) Validate() error {
 	for height, l := range h.Layers {
 		if height < 0 || l.Height != height || strings.TrimSpace(l.Name) == "" {
 			return fmt.Errorf("%w: bad layer %d:%q", ErrCorruptHeader, height, l.Name)
+		}
+		seen := map[string]bool{}
+		for _, a := range l.Attrs {
+			if strings.TrimSpace(a) == "" {
+				return fmt.Errorf("%w: empty attribute name in layer %q", ErrCorruptHeader, l.Name)
+			}
+			if seen[a] {
+				return fmt.Errorf("%w: duplicate attribute %q in layer %q", ErrCorruptHeader, a, l.Name)
+			}
+			seen[a] = true
 		}
 	}
 	if h.CommitLogStart < HeaderBlockSize ||
@@ -239,7 +361,12 @@ func (h *Header) Marshal() ([]byte, error) {
 	heights := h.LayerHeights()
 	parts := make([]string, 0, len(heights))
 	for _, height := range heights {
-		parts = append(parts, fmt.Sprintf("%d:%s", height, h.Layers[height].Name))
+		l := h.Layers[height]
+		entry := fmt.Sprintf("%d:%s", height, l.Name)
+		if len(l.Attrs) > 0 {
+			entry += "(" + strings.Join(l.Attrs, ",") + ")"
+		}
+		parts = append(parts, entry)
 	}
 	b.WriteString("Layers:[" + strings.Join(parts, ", ") + "]\n")
 	if len(h.Branches) > 0 {

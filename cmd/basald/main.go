@@ -7,12 +7,10 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -24,7 +22,7 @@ func main() {
 	var (
 		addr    = flag.String("addr", ":8080", "HTTP listen address")
 		file    = flag.String("file", "basal.bsl", "path of the .bsl container")
-		layers  = flag.String("layers", "Accounts,Teams,Users", "layer definitions used when creating a new container (\"0:Accounts,1:Teams\" or \"Accounts,Teams\")")
+		layers  = flag.String("layers", "Accounts,Teams,Users", "layer definitions used when creating a new container; optional attribute names enable symbolic BQL (\"0:Accounts(name,date),1:Teams(name)\" or \"Accounts,Teams\")")
 		author  = flag.String("author", "basald <basald@localhost>", "Author of the initialization commit")
 		summary = flag.String("summary", "Database initialized", "Summary of the initialization commit")
 		reason  = flag.String("reason", "daemon startup on empty container", "Reason of the initialization commit")
@@ -82,28 +80,9 @@ func openOrCreate(path, layersFlag string, meta engine.TxMeta) (*engine.DB, erro
 	return engine.Init(path, layers, meta)
 }
 
-// parseLayers accepts "Accounts,Teams,Users" (heights assigned in order) or
-// "0:Accounts,1:Teams,2:Users" (explicit heights).
+// parseLayers accepts "Accounts,Teams,Users" (heights assigned in order),
+// "0:Accounts,1:Teams,2:Users" (explicit heights), and optional
+// attribute-name declarations "0:Accounts(name,date)" for symbolic BQL.
 func parseLayers(flagValue string) ([]engine.Layer, error) {
-	var out []engine.Layer
-	for i, part := range strings.Split(flagValue, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		height := i
-		name := part
-		if hStr, n, ok := strings.Cut(part, ":"); ok {
-			var h int
-			if _, err := fmt.Sscanf(hStr, "%d", &h); err != nil {
-				return nil, fmt.Errorf("bad layer definition %q", part)
-			}
-			height, name = h, strings.TrimSpace(n)
-		}
-		out = append(out, engine.Layer{Height: height, Name: name})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no layers given")
-	}
-	return out, nil
+	return engine.ParseLayers(flagValue)
 }

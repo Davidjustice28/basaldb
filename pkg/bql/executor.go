@@ -2,16 +2,19 @@ package bql
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 
 	"basaldb/pkg/engine"
 )
 
-// ExecContext binds a query to a database, a branch and the mandatory audit
-// metadata required by every write statement.
+// ExecContext binds a query to a database, a branch and the optional
+// audit metadata stamped onto commit blocks.
 type ExecContext struct {
 	DB     *engine.DB
 	Branch string
-	Meta   engine.TxMeta // Author, Summary, Reason (required for writes)
+	Meta   engine.TxMeta // Author, Summary, Reason (required for BRANCH CREATE)
 }
 
 // Row is one result row. Record rows carry the structured record fields;
@@ -104,23 +107,31 @@ func layerHeight(layers []engine.Layer, name string) (int, bool) {
 	return 0, false
 }
 
-func matchSel(r *engine.Record, sel Selector) bool {
-	switch sel.Kind {
-	case SelAll:
-		return true
-	case SelID:
-		return r.ID == sel.N
-	case SelSlot:
-		return r.Slot == sel.N
+// matchRef resolves a RecordRef inside a write transaction to the
+// records matching its filters.
+func matchRef(tx *engine.WriteTx, ref RecordRef) ([]*engine.Record, error) {
+	h, ok := layerHeight(tx.Layers(), ref.Layer)
+	if !ok {
+		return nil, fmt.Errorf("bql: unknown layer %q", ref.Layer)
 	}
-	return false
+	all, err := tx.Records(ref.Layer)
+	if err != nil {
+		return nil, err
+	}
+	return filterRecords(tx.Layers(), h, all, ref.Filters)
 }
 
 // execGet runs a path traversal (zero join) over an immutable MVCC
-// snapshot.
+// snapshot. Steps filter as they walk; the final step projects
+// attribute columns and applies limit/sort to the result.
 func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	if len(s.Path) == 0 {
 		return nil, fmt.Errorf("bql: GET requires a starting layer")
+	}
+	for i, step := range s.Path[:len(s.Path)-1] {
+		if step.Modifiers != (GetModifiers{}) {
+			return nil, fmt.Errorf("bql: limit/sort only apply to the final step (used on step %d, %q)", i+1, step.Layer)
+		}
 	}
 	snap, err := ctx.DB.Snapshot(branch)
 	if err != nil {
@@ -135,7 +146,7 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	if !ok {
 		return nil, fmt.Errorf("bql: unknown layer %q", first.Layer)
 	}
-	cur, err := selectRecords(snap, h, first)
+	cur, err := filterRecords(snap.Layers(), h, snap.Records(h), first.Filters)
 	if err != nil {
 		return nil, err
 	}
@@ -152,19 +163,41 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 		}
 		var next []*engine.Record
 		for _, r := range cur {
-			for _, child := range snap.Children(curHeight, r.ID) {
-				if matchSel(child, step.Sel) {
-					next = append(next, child)
-				}
-			}
+			next = append(next, snap.Children(curHeight, r.ID)...)
+		}
+		next, err = filterRecords(snap.Layers(), stepH, next, step.Filters)
+		if err != nil {
+			return nil, err
 		}
 		cur = next
 		curHeight = stepH
 	}
 
+	final := s.Path[len(s.Path)-1]
+	finalLayer := snap.Layers()[curHeight]
 	rows := make([]Row, 0, len(cur))
 	for _, r := range cur {
-		rows = append(rows, recordRow(snap.Layers()[curHeight].Name, r))
+		row := recordRow(finalLayer.Name, r)
+		if len(final.Project) > 0 {
+			attrs, err := projectAttrs(finalLayer, r, final.Project)
+			if err != nil {
+				return nil, err
+			}
+			row.Attrs = attrs
+		}
+		rows = append(rows, row)
+	}
+	if final.Modifiers.Sort != "" {
+		asc := final.Modifiers.Sort == "asc"
+		sort.SliceStable(rows, func(i, j int) bool {
+			if asc {
+				return rows[i].ID < rows[j].ID
+			}
+			return rows[i].ID > rows[j].ID
+		})
+	}
+	if n := final.Modifiers.Limit; n > 0 && len(rows) > n {
+		rows = rows[:n]
 	}
 	return &Result{
 		Columns: recordColumns,
@@ -173,22 +206,144 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	}, nil
 }
 
-func selectRecords(snap *engine.Snapshot, height int, ref Ref) ([]*engine.Record, error) {
-	switch ref.Sel.Kind {
-	case SelAll:
-		return snap.Records(height), nil
-	case SelID:
-		if r, ok := snap.Record(height, ref.Sel.N); ok {
-			return []*engine.Record{r}, nil
-		}
-		return nil, fmt.Errorf("bql: record %d not found in layer %q", ref.Sel.N, ref.Layer)
-	case SelSlot:
-		if r, ok := snap.RecordBySlot(height, ref.Sel.N); ok {
-			return []*engine.Record{r}, nil
-		}
-		return nil, fmt.Errorf("bql: slot #%d not found in layer %q", ref.Sel.N, ref.Layer)
+// filterRecords drops records that fail any filter of the step.
+func filterRecords(layers []engine.Layer, height int, recs []*engine.Record, filters []Filter) ([]*engine.Record, error) {
+	if len(filters) == 0 {
+		return recs, nil
 	}
-	return nil, fmt.Errorf("bql: bad selector %v", ref.Sel)
+	layer := layers[height]
+	var out []*engine.Record
+	for _, r := range recs {
+		keep := true
+		for _, f := range filters {
+			ok, err := evalFilter(layer, r, f)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// evalFilter evaluates one filter against a record. Builtin fields (id,
+// slot, parent) compare numerically; attributes compare as stored
+// strings, with ordering operators using numeric comparison when both
+// sides parse as numbers.
+func evalFilter(layer engine.Layer, r *engine.Record, f Filter) (bool, error) {
+	switch strings.ToLower(f.Field) {
+	case "id":
+		return compareNumFilter(float64(r.ID), f)
+	case "slot":
+		return compareNumFilter(float64(r.Slot), f)
+	case "parent":
+		return compareNumFilter(float64(r.Parent), f)
+	}
+	idx := -1
+	if n, err := strconv.Atoi(f.Field); err == nil {
+		idx = n
+	} else {
+		i, ok := layer.AttrIndex(f.Field)
+		if !ok {
+			return false, attrUnknownError(layer, f.Field)
+		}
+		idx = i
+	}
+	if idx < 0 || idx >= len(r.Attrs) {
+		return false, nil // an out-of-range attribute never matches
+	}
+	return compareAttrFilter(r.Attrs[idx], f)
+}
+
+func attrUnknownError(layer engine.Layer, name string) error {
+	if len(layer.Attrs) == 0 {
+		return fmt.Errorf("bql: layer %q declares no attribute names; init it with -layers \"%d:%s(name,...)\" or reference attributes by index",
+			layer.Name, layer.Height, layer.Name)
+	}
+	return fmt.Errorf("bql: layer %q has no attribute %q (declared: %s)", layer.Name, name, strings.Join(layer.Attrs, ", "))
+}
+
+func compareNumFilter(actual float64, f Filter) (bool, error) {
+	want, err := strconv.ParseFloat(f.Value, 64)
+	if err != nil {
+		return false, fmt.Errorf("bql: %s filter needs a number, got %q", f.Field, f.Value)
+	}
+	switch f.Op {
+	case OpEq:
+		return actual == want, nil
+	case OpNe:
+		return actual != want, nil
+	case OpGt:
+		return actual > want, nil
+	case OpGte:
+		return actual >= want, nil
+	case OpLt:
+		return actual < want, nil
+	default:
+		return actual <= want, nil
+	}
+}
+
+func compareAttrFilter(actual string, f Filter) (bool, error) {
+	switch f.Op {
+	case OpEq:
+		return actual == f.Value, nil
+	case OpNe:
+		return actual != f.Value, nil
+	}
+	a, aErr := strconv.ParseFloat(actual, 64)
+	b, bErr := strconv.ParseFloat(f.Value, 64)
+	if aErr == nil && bErr == nil {
+		switch f.Op {
+		case OpGt:
+			return a > b, nil
+		case OpGte:
+			return a >= b, nil
+		case OpLt:
+			return a < b, nil
+		default:
+			return a <= b, nil
+		}
+	}
+	switch f.Op {
+	case OpGt:
+		return actual > f.Value, nil
+	case OpGte:
+		return actual >= f.Value, nil
+	case OpLt:
+		return actual < f.Value, nil
+	default:
+		return actual <= f.Value, nil
+	}
+}
+
+// projectAttrs resolves a projection against the layer's declared
+// attribute names and returns only the referenced columns, in the order
+// written. An index past the record's attributes yields "".
+func projectAttrs(layer engine.Layer, r *engine.Record, proj []AttrRef) ([]string, error) {
+	out := make([]string, 0, len(proj))
+	for _, a := range proj {
+		idx := a.Index
+		if a.ByName {
+			i, ok := layer.AttrIndex(a.Name)
+			if !ok {
+				return nil, attrUnknownError(layer, a.Name)
+			}
+			idx = i
+		}
+		if idx < 0 || idx >= len(r.Attrs) {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, r.Attrs[idx])
+	}
+	return out, nil
 }
 
 // execCreate creates a record, optionally under an existing parent, in
@@ -208,21 +363,14 @@ func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error)
 
 	parentID := uint64(0)
 	if s.Parent != nil {
-		if s.Parent.Sel.Kind == SelAll {
-			return fail(fmt.Errorf("bql: PARENT %s must select a single record ([N] or [#N])", s.Parent))
+		matches, err := matchRef(tx, *s.Parent)
+		if err != nil {
+			return fail(err)
 		}
-		var rec *engine.Record
-		if s.Parent.Sel.Kind == SelID {
-			if r, ok := tx.Record(s.Parent.Layer, s.Parent.Sel.N); ok {
-				rec = r
-			}
-		} else if r, ok := tx.RecordBySlot(s.Parent.Layer, s.Parent.Sel.N); ok {
-			rec = r
+		if len(matches) != 1 {
+			return fail(fmt.Errorf("bql: PARENT %s matched %d records (need exactly 1)", s.Parent, len(matches)))
 		}
-		if rec == nil {
-			return fail(fmt.Errorf("bql: parent %s not found", s.Parent))
-		}
-		parentID = rec.ID
+		parentID = matches[0].ID
 	}
 
 	rec, err := tx.Create(s.Layer, parentID, s.Attrs)
@@ -248,44 +396,32 @@ func execUpdate(ctx *ExecContext, branch string, s *UpdateStmt) (*Result, error)
 		tx.Rollback()
 		return nil, err
 	}
-	if _, ok := layerHeight(tx.Layers(), s.Ref.Layer); !ok {
-		return fail(fmt.Errorf("bql: unknown layer %q", s.Ref.Layer))
-	}
-	all, err := tx.Records(s.Ref.Layer)
+	matches, err := matchRef(tx, s.Target)
 	if err != nil {
 		return fail(err)
 	}
-	var matches []*engine.Record
-	for _, r := range all {
-		if matchSel(r, s.Ref.Sel) {
-			matches = append(matches, r)
-		}
-	}
 	if len(matches) == 0 {
-		return fail(fmt.Errorf("bql: no records in %q matched %s", s.Ref.Layer, s.Ref))
+		return fail(fmt.Errorf("bql: no records in %q matched [%s]", s.Target.Layer, filtersString(s.Target.Filters)))
 	}
 	var rows []Row
 	for _, r := range matches {
-		rec, err := tx.Update(s.Ref.Layer, r.ID, s.Attrs)
+		rec, err := tx.Update(s.Target.Layer, r.ID, s.Attrs)
 		if err != nil {
 			return fail(err)
 		}
-		rows = append(rows, recordRow(s.Ref.Layer, rec))
+		rows = append(rows, recordRow(s.Target.Layer, rec))
 	}
 	snap, err := tx.Commit()
 	if err != nil {
 		return nil, err
 	}
-	return writeResult(ctx, snap, fmt.Sprintf("updated %d record(s) in %q", len(matches), s.Ref.Layer), rows), nil
+	return writeResult(ctx, snap, fmt.Sprintf("updated %d record(s) in %q", len(matches), s.Target.Layer), rows), nil
 }
 
-// execDelete cascade-deletes the selected record and every descendant in
-// one commit. A wildcard cannot root a cascade: the engine needs a single
-// record to prune from.
+// execDelete cascade-deletes every record matching the filters (and all
+// of each root's descendants) in one commit. Without filters it empties
+// the layer.
 func execDelete(ctx *ExecContext, branch string, s *DeleteStmt) (*Result, error) {
-	if s.Ref.Sel.Kind == SelAll {
-		return nil, fmt.Errorf("bql: DELETE %s must select a single record ([N] or [#N])", s.Ref)
-	}
 	tx, err := ctx.DB.Begin(branch, ctx.Meta)
 	if err != nil {
 		return nil, err
@@ -294,30 +430,28 @@ func execDelete(ctx *ExecContext, branch string, s *DeleteStmt) (*Result, error)
 		tx.Rollback()
 		return nil, err
 	}
-	if _, ok := layerHeight(tx.Layers(), s.Ref.Layer); !ok {
-		return fail(fmt.Errorf("bql: unknown layer %q", s.Ref.Layer))
-	}
-	var root *engine.Record
-	if s.Ref.Sel.Kind == SelID {
-		if r, ok := tx.Record(s.Ref.Layer, s.Ref.Sel.N); ok {
-			root = r
-		}
-	} else if r, ok := tx.RecordBySlot(s.Ref.Layer, s.Ref.Sel.N); ok {
-		root = r
-	}
-	if root == nil {
-		return fail(fmt.Errorf("bql: record %s not found", s.Ref))
-	}
-	total, err := tx.Delete(s.Ref.Layer, root.ID)
+	matches, err := matchRef(tx, s.Target)
 	if err != nil {
 		return fail(err)
+	}
+	if len(matches) == 0 {
+		return fail(fmt.Errorf("bql: no records in %q matched [%s]", s.Target.Layer, filtersString(s.Target.Filters)))
+	}
+	total := 0
+	for _, r := range matches {
+		n, err := tx.Delete(s.Target.Layer, r.ID)
+		if err != nil {
+			return fail(err)
+		}
+		total += n
 	}
 	snap, err := tx.Commit()
 	if err != nil {
 		return nil, err
 	}
 	return writeResult(ctx, snap,
-		fmt.Sprintf("cascade deleted %d record(s) under %s", total, s.Ref), nil), nil
+		fmt.Sprintf("cascade deleted %d record(s) under %d root(s) in %q",
+			total, len(matches), s.Target.Layer), nil), nil
 }
 
 func writeResult(ctx *ExecContext, snap *engine.Snapshot, message string, rows []Row) *Result {

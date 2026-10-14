@@ -1,7 +1,7 @@
 // Package bql implements BasalQL (BQL), the path-based query language of
 // BasalDB: zero-join hierarchical lookups like
 //
-//	GET Accounts[0] -> Teams -> Users
+//	GET Accounts[id=0] -> Teams -> Users[Name,Email][age=(gt=21)][limit=5]
 //
 // plus mutation and branching statements executed against engine snapshots.
 package bql
@@ -30,6 +30,7 @@ const (
 	tokStar   // *
 	tokPipe   // |
 	tokSemi   // ;
+	tokEqual  // =
 )
 
 type token struct {
@@ -69,6 +70,8 @@ func (t token) String() string {
 		return "|"
 	case tokSemi:
 		return ";"
+	case tokEqual:
+		return "="
 	}
 	return "?"
 }
@@ -111,6 +114,9 @@ func lex(input string) ([]token, error) {
 		case c == ';':
 			toks = append(toks, token{kind: tokSemi, text: ";", pos: i})
 			i++
+		case c == '=':
+			toks = append(toks, token{kind: tokEqual, text: "=", pos: i})
+			i++
 		case c == '"' || c == '\'':
 			s, next, err := lexString(input, i)
 			if err != nil {
@@ -118,12 +124,20 @@ func lex(input string) ([]token, error) {
 			}
 			toks = append(toks, token{kind: tokString, text: s, pos: i})
 			i = next
-		case c >= '0' && c <= '9':
-			j := i
+		case c >= '0' && c <= '9',
+			c == '-' && i+1 < len(input) && input[i+1] >= '0' && input[i+1] <= '9':
+			j := i + 1
 			for j < len(input) && input[j] >= '0' && input[j] <= '9' {
 				j++
 			}
-			n, err := strconv.ParseUint(input[i:j], 10, 64)
+			// num holds the magnitude; a leading '-' stays in text so
+			// consumers that support signed values (filter comparisons)
+			// can re-parse, while selectors can reject it explicitly.
+			start := i
+			if c == '-' {
+				start = i + 1
+			}
+			n, err := strconv.ParseUint(input[start:j], 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("bql: bad number %q at %d", input[i:j], i)
 			}

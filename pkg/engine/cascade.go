@@ -13,7 +13,7 @@ import (
 // constant number of range-mask operations, independent of the number of
 // indexes or tables a relational engine would have to visit.
 //
-// The deletion is recorded in the commit block (mandatory Author, Summary,
+// The deletion is recorded in the commit block (Author, Summary,
 // Reason) and replayed deterministically from the journal after a crash.
 func (tx *WriteTx) Delete(layerName string, id uint64) (int, error) {
 	if err := tx.check(); err != nil {

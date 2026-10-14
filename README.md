@@ -23,13 +23,20 @@ Row 0 (Accounts)   [   Account #1     ]  <-- Children: [Team#0, Team#1]
 
 ---
 
+## Usage
+
+See [CLI.md](CLI.md) for the `basal` command-line reference: a 60-second
+quickstart, the core concepts, the full BasalQL syntax (path traversal,
+filters, column projection, limit/sort), branching, output formats, and
+the REST API served by `basald`.
+
 ## Key Features
 
 * **$O(1)$ Matrix Cascade Deletes:** Deleting a parent node instantly invalidates its child array range via top-down memory block pruning—zero recursive table sweeps.
 * **Zero-Join Path Traversals:** Navigate hierarchy paths using $O(1)$ array offset math: `Address = BaseAddress + (Y * RowSize) + X`.
-* **Git-Style Audit Trail:** Every transaction records an immutable commit block with mandatory `AUTHOR`, `SUMMARY`, and `REASON` metadata.
+* **Git-Style Audit Trail:** Every transaction records an immutable commit block. Record writes stamp it with `AUTHOR`, `SUMMARY` and `REASON` when provided; structural operations (container initialization, branch creation) require them.
 * **Single-File Portability (`.bsl`):** Zero setup, portable single-file container storage with human-readable ASCII header layers and slotted binary data pages.
-* **BasalQL (BQL):** Simple, path-based query language engineered for hierarchical lookups (`GET Accounts[0] -> Teams -> Users`).
+* **BasalQL (BQL):** Simple, path-based query language engineered for hierarchical lookups with column projection, filters and limit/sort (`GET Accounts[id=0] -> Teams -> Users`, `GET Users[Name,Age][Age=(gt=21)][limit=5,sort=desc]`).
 
 ---
 

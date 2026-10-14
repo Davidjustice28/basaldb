@@ -12,22 +12,31 @@ import (
 	"strings"
 
 	"basaldb/pkg/bql"
+	"basaldb/pkg/config"
 	"basaldb/pkg/engine"
 )
 
 const usage = `basal - BasalDB single-file database utility
 
 Usage:
-  basal init    -file DATA.bsl -layers 0:Accounts,1:Teams,2:Users [-author A -summary S -reason R]
-  basal inspect -file DATA.bsl [-branch NAME] [-header] [-json]
-  basal query   -file DATA.bsl [-branch NAME] [-author A -summary S -reason R] 'BQL STATEMENT'
-  basal branch  list -file DATA.bsl
-  basal branch  create NAME -file DATA.bsl [-from SRC] [-author A -summary S -reason R]
+  basal init    [-file DATA.bsl] [-layers 0:Accounts,1:Teams,2:Users] [-author A -summary S -reason R]
+  basal inspect [-file DATA.bsl] [-branch NAME] [-header] [-json]
+  basal query   [-file DATA.bsl] [-branch NAME] [-author A -summary S -reason R] 'BQL STATEMENT'
+  basal branch  list [-file DATA.bsl]
+  basal branch  create NAME [-file DATA.bsl] [-from SRC] [-author A -summary S -reason R]
+  basal config  list | get KEY | set KEY VALUE | unset KEY
+
+Defaults (flags always win):
+  -file   from 'basal config set file',   else ./basal.bsl
+  -branch from 'basal config set branch', else main
+  Keys: file, branch. Config path: $BASAL_CONFIG or the user config
+  directory ('basal config list' prints it).
 
 BQL examples:
-  GET Accounts[0] -> Teams -> Users
-  CREATE Users PARENT Teams[101] ("Sam", "sam@dev.io")
-  DELETE Accounts[1]
+  GET Accounts[id=0] -> Teams -> Users
+  GET Users[Name,Age][Age=(gt=21)][limit=5,sort=desc]
+  CREATE Users PARENT Teams[id=101] ("Sam", "sam@dev.io")
+  DELETE Accounts[id=1]
   SHOW COMMITS
 `
 
@@ -46,6 +55,8 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "branch":
 		err = cmdBranch(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -82,65 +93,52 @@ func splitArgs(args []string, boolFlags map[string]bool) (flagArgs, posArgs []st
 }
 
 func parseLayersFlag(value string) ([]engine.Layer, error) {
-	var out []engine.Layer
-	for i, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		height, name := i, part
-		if hStr, n, ok := strings.Cut(part, ":"); ok {
-			h, err := strconv.Atoi(strings.TrimSpace(hStr))
-			if err != nil {
-				return nil, fmt.Errorf("bad layer definition %q", part)
-			}
-			height, name = h, strings.TrimSpace(n)
-		}
-		out = append(out, engine.Layer{Height: height, Name: name})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no layers given")
-	}
-	return out, nil
+	return engine.ParseLayers(value)
 }
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	file := fs.String("file", "", "path of the .bsl container to create")
-	layers := fs.String("layers", "Accounts,Teams,Users", "layer definitions")
+	file := fs.String("file", "", "path of the .bsl container to create (default: 'basal config set file', else ./basal.bsl)")
+	layers := fs.String("layers", "Accounts,Teams,Users", "layer definitions; optional attribute names enable symbolic BQL (\"0:Accounts(name,date),1:Teams(name)\")")
 	author := fs.String("author", "basal <basal@localhost>", "Author of the initialization commit")
 	summary := fs.String("summary", "Database initialized", "Summary of the initialization commit")
 	reason := fs.String("reason", "manual initialization", "Reason of the initialization commit")
 	_ = fs.Parse(args)
-	if *file == "" {
-		return fmt.Errorf("init: -file is required")
+	path, err := config.ResolveFile(*file)
+	if err != nil {
+		return err
 	}
 	ls, err := parseLayersFlag(*layers)
 	if err != nil {
 		return err
 	}
 	meta := engine.TxMeta{Author: *author, Summary: *summary, Reason: *reason}
-	db, err := engine.Init(*file, ls, meta)
+	db, err := engine.Init(path, ls, meta)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 	fmt.Printf("initialized %s\nlayers: %s\ninitial commit: %d (%s / %s / %s)\n",
-		*file, *layers, 1, meta.Author, meta.Summary, meta.Reason)
+		path, *layers, 1, meta.Author, meta.Summary, meta.Reason)
 	return nil
 }
 
 func cmdInspect(args []string) error {
 	fs := flag.NewFlagSet("inspect", flag.ExitOnError)
-	file := fs.String("file", "", "path of the .bsl container")
-	branch := fs.String("branch", engine.DefaultBranch, "branch to inspect")
+	file := fs.String("file", "", "path of the .bsl container (default: 'basal config set file', else ./basal.bsl)")
+	branch := fs.String("branch", "", "branch to inspect (default: 'basal config set branch', else main)")
 	header := fs.Bool("header", false, "print the raw ASCII header block")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
-	if *file == "" {
-		return fmt.Errorf("inspect: -file is required")
+	path, err := config.ResolveFile(*file)
+	if err != nil {
+		return err
 	}
-	db, err := engine.Open(*file)
+	branchName, err := config.ResolveBranch(*branch)
+	if err != nil {
+		return err
+	}
+	db, err := engine.Open(path)
 	if err != nil {
 		return err
 	}
@@ -154,7 +152,7 @@ func cmdInspect(args []string) error {
 		fmt.Println(strings.TrimRight(string(block), "\n"))
 		return nil
 	}
-	snap, err := db.Snapshot(*branch)
+	snap, err := db.Snapshot(branchName)
 	if err != nil {
 		return err
 	}
@@ -185,7 +183,7 @@ func cmdInspect(args []string) error {
 		fmt.Printf("  %s\n", b)
 	}
 	fmt.Println("commits:")
-	for _, e := range db.Commits(*branch) {
+	for _, e := range db.Commits(branchName) {
 		author, summary, reason := e.Meta()
 		if e.Commit != nil {
 			fmt.Printf("  [%04d] %s | %s | %s | %s\n", e.Commit.ID, e.Commit.Branch, author, summary, reason)
@@ -196,23 +194,91 @@ func cmdInspect(args []string) error {
 	return nil
 }
 
+// cmdConfig reads and writes the per-user defaults (like gcloud config):
+// the container and branch later commands use when -file/-branch are
+// left off.
+func cmdConfig(args []string) error {
+	action := "list"
+	if len(args) > 0 {
+		action, args = args[0], args[1:]
+	}
+	switch action {
+	case "list":
+		if len(args) > 0 {
+			return fmt.Errorf("config: unexpected argument %q", args[0])
+		}
+		path, err := config.Path()
+		if err != nil {
+			return err
+		}
+		c, err := config.Load()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("config: %s\nfile:   %s\nbranch: %s\n", path, orUnset(c.File), orUnset(c.Branch))
+		return nil
+	case "get":
+		if len(args) != 1 {
+			return fmt.Errorf("config: usage: basal config get KEY")
+		}
+		value, err := config.Get(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Println(value)
+		return nil
+	case "set":
+		if len(args) != 2 {
+			return fmt.Errorf("config: usage: basal config set KEY VALUE")
+		}
+		if err := config.Set(args[0], args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("%s = %s\n", strings.ToLower(args[0]), args[1])
+		return nil
+	case "unset":
+		if len(args) != 1 {
+			return fmt.Errorf("config: usage: basal config unset KEY")
+		}
+		if err := config.Unset(args[0]); err != nil {
+			return err
+		}
+		fmt.Printf("%s unset\n", strings.ToLower(args[0]))
+		return nil
+	default:
+		return fmt.Errorf("config: unknown action %q (want list, get, set or unset)", action)
+	}
+}
+
+func orUnset(v string) string {
+	if v == "" {
+		return "(unset)"
+	}
+	return v
+}
+
 func cmdQuery(args []string) error {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	file := fs.String("file", "", "path of the .bsl container")
-	branch := fs.String("branch", engine.DefaultBranch, "branch to run against")
-	author := fs.String("author", "", "Author for write statements")
-	summary := fs.String("summary", "", "Summary for write statements")
-	reason := fs.String("reason", "", "Reason for write statements")
+	file := fs.String("file", "", "path of the .bsl container (default: 'basal config set file', else ./basal.bsl)")
+	branch := fs.String("branch", "", "branch to run against (default: 'basal config set branch', else main)")
+	author := fs.String("author", "", "stamps the commit block (required for BRANCH CREATE)")
+	summary := fs.String("summary", "", "stamps the commit block (required for BRANCH CREATE)")
+	reason := fs.String("reason", "", "stamps the commit block (required for BRANCH CREATE)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	flagArgs, posArgs := splitArgs(args, map[string]bool{"json": true})
 	_ = fs.Parse(flagArgs)
-	if *file == "" {
-		return fmt.Errorf("query: -file is required")
-	}
 	if len(posArgs) != 1 {
 		return fmt.Errorf("query: exactly one BQL statement required")
 	}
-	db, err := engine.Open(*file)
+	path, err := config.ResolveFile(*file)
+	if err != nil {
+		return err
+	}
+	branchName, err := config.ResolveBranch(*branch)
+	if err != nil {
+		return err
+	}
+	db, err := engine.Open(path)
 	if err != nil {
 		return err
 	}
@@ -220,7 +286,7 @@ func cmdQuery(args []string) error {
 
 	ctx := &bql.ExecContext{
 		DB:     db,
-		Branch: *branch,
+		Branch: branchName,
 		Meta:   engine.TxMeta{Author: *author, Summary: *summary, Reason: *reason},
 	}
 	res, err := bql.Exec(ctx, posArgs[0])
@@ -238,16 +304,17 @@ func cmdBranch(args []string) error {
 	switch sub {
 	case "list":
 		fs := flag.NewFlagSet("branch list", flag.ExitOnError)
-		file := fs.String("file", "", "path of the .bsl container")
+		file := fs.String("file", "", "path of the .bsl container (default: 'basal config set file', else ./basal.bsl)")
 		flagArgs, posArgs := splitArgs(args[1:], nil)
 		if len(posArgs) > 0 {
 			return fmt.Errorf("branch list: unexpected argument %q", posArgs[0])
 		}
 		_ = fs.Parse(flagArgs)
-		if *file == "" {
-			return fmt.Errorf("branch list: -file is required")
+		path, err := config.ResolveFile(*file)
+		if err != nil {
+			return err
 		}
-		db, err := engine.Open(*file)
+		db, err := engine.Open(path)
 		if err != nil {
 			return err
 		}
@@ -258,20 +325,21 @@ func cmdBranch(args []string) error {
 		return nil
 	case "create":
 		fs := flag.NewFlagSet("branch create", flag.ExitOnError)
-		file := fs.String("file", "", "path of the .bsl container")
+		file := fs.String("file", "", "path of the .bsl container (default: 'basal config set file', else ./basal.bsl)")
 		from := fs.String("from", engine.DefaultBranch, "source branch to fork at its head")
 		author := fs.String("author", "basal <basal@localhost>", "Author of the branch event")
 		summary := fs.String("summary", "Branch created", "Summary of the branch event")
 		reason := fs.String("reason", "feature isolation", "Reason of the branch event")
 		flagArgs, posArgs := splitArgs(args[1:], nil)
 		_ = fs.Parse(flagArgs)
-		if *file == "" {
-			return fmt.Errorf("branch create: -file is required")
-		}
 		if len(posArgs) != 1 {
 			return fmt.Errorf("branch create: exactly one branch name required")
 		}
-		db, err := engine.Open(*file)
+		path, err := config.ResolveFile(*file)
+		if err != nil {
+			return err
+		}
+		db, err := engine.Open(path)
 		if err != nil {
 			return err
 		}

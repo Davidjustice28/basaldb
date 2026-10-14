@@ -69,12 +69,23 @@ func TestQueryAndExecute(t *testing.T) {
 		t.Fatalf("commit block = %+v", res.Commit)
 	}
 
-	// Writes without metadata are rejected.
+	// Record writes are metadata-free; the commit block carries none.
 	resp = post(t, srv, "/v1/execute", map[string]string{"statement": `CREATE Accounts ("X")`})
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("metadata-less write status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metadata-less write status = %d, want 200", resp.StatusCode)
+	}
+	var bare struct {
+		Commit *struct {
+			Author string `json:"author"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bare); err != nil {
+		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if bare.Commit == nil || bare.Commit.Author != "" {
+		t.Fatalf("commit block = %+v, want an empty-author commit", bare.Commit)
+	}
 
 	// Read-only query endpoint.
 	resp, err := http.Get(srv.URL + "/v1/query?q=" + urlEscape(`GET Accounts[*]`))
@@ -93,12 +104,12 @@ func TestQueryAndExecute(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(qres.Rows) != 1 || qres.Rows[0].Attrs[0] != "Acme Corp" {
+	if len(qres.Rows) != 2 || qres.Rows[0].Attrs[0] != "Acme Corp" {
 		t.Fatalf("query rows = %+v", qres.Rows)
 	}
 
 	// /v1/query rejects writes.
-	resp, err = http.Get(srv.URL + "/v1/query?q=" + urlEscape(`DELETE Accounts[1]`))
+	resp, err = http.Get(srv.URL + "/v1/query?q=" + urlEscape(`DELETE Accounts[id=1]`))
 	if err != nil {
 		t.Fatal(err)
 	}

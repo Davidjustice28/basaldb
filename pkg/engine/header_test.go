@@ -146,3 +146,80 @@ func TestHeaderNulPaddingTolerated(t *testing.T) {
 		t.Errorf("DataEnd = %d, want %d", got.DataEnd, h.DataEnd)
 	}
 }
+
+func TestHeaderRoundTripsAttributeNames(t *testing.T) {
+	h := validHeader()
+	h.Layers[0] = Layer{Height: 0, Name: "Accounts", Attrs: []string{"name", "joined"}}
+	block, err := h.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(block[:HeaderBlockSize]), "0:Accounts(name,joined)") {
+		t.Errorf("header lacks attribute declaration:\n%s", string(block[:200]))
+	}
+	got, err := ParseHeader(block)
+	if err != nil {
+		t.Fatalf("ParseHeader: %v", err)
+	}
+	l := got.Layers[0]
+	if len(l.Attrs) != 2 || l.Attrs[0] != "name" || l.Attrs[1] != "joined" {
+		t.Errorf("layer 0 attrs = %v", l.Attrs)
+	}
+	if i, ok := l.AttrIndex("joined"); !ok || i != 1 {
+		t.Errorf("AttrIndex(joined) = %d, %v", i, ok)
+	}
+	if _, ok := l.AttrIndex("missing"); ok {
+		t.Error("AttrIndex(missing) succeeded")
+	}
+}
+
+func TestParseLayersSpec(t *testing.T) {
+	cases := []struct {
+		spec string
+		want []Layer
+	}{
+		{"Accounts,Teams", []Layer{
+			{Height: 0, Name: "Accounts"},
+			{Height: 1, Name: "Teams"},
+		}},
+		{"0:Accounts(name,date),2:Users(name,email)", []Layer{
+			{Height: 0, Name: "Accounts", Attrs: []string{"name", "date"}},
+			{Height: 2, Name: "Users", Attrs: []string{"name", "email"}},
+		}},
+	}
+	for _, tc := range cases {
+		got, err := ParseLayers(tc.spec)
+		if err != nil {
+			t.Errorf("ParseLayers(%q): %v", tc.spec, err)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("ParseLayers(%q) = %+v", tc.spec, got)
+			continue
+		}
+		for i := range got {
+			if got[i].Height != tc.want[i].Height ||
+				got[i].Name != tc.want[i].Name ||
+				strings.Join(got[i].Attrs, ",") != strings.Join(tc.want[i].Attrs, ",") {
+				t.Errorf("ParseLayers(%q)[%d] = %+v, want %+v", tc.spec, i, got[i], tc.want[i])
+			}
+		}
+	}
+	for _, bad := range []string{"", "0:Accounts(name,),1:Teams", "x:Accounts", "Accounts(nope", "0:A,0:B"} {
+		if _, err := ParseLayers(bad); err == nil {
+			t.Errorf("ParseLayers(%q) succeeded, want error", bad)
+		}
+	}
+}
+
+func TestValidateRejectsDuplicateAttributes(t *testing.T) {
+	h := validHeader()
+	h.Layers[0] = Layer{Height: 0, Name: "Accounts", Attrs: []string{"name", "name"}}
+	if _, err := h.Marshal(); !errors.Is(err, ErrCorruptHeader) {
+		t.Errorf("Marshal with duplicate attrs = %v, want ErrCorruptHeader", err)
+	}
+	h.Layers[0] = Layer{Height: 0, Name: "Accounts", Attrs: []string{"name", ""}}
+	if _, err := h.Marshal(); !errors.Is(err, ErrCorruptHeader) {
+		t.Errorf("Marshal with empty attr = %v, want ErrCorruptHeader", err)
+	}
+}
