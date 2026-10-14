@@ -278,8 +278,10 @@ Every statement is built from the same bracket syntax:
 **Fields** you can filter on: declared attribute names, positional
 indexes (`0`, `1`, …), and the built-ins `id`, `slot` and `parent`.
 
-**Values**: quote them if they contain spaces or symbols (`"Acme Corp"`,
-`"#ff0000"`). Single or double quotes both work; escapes are `\n \t \\ \" \'`.
+**Values**: only plain words and whole numbers can be unquoted
+(`role=admin`, `id=3`). Quote anything with spaces, dots or symbols,
+**including decimals**: `"Acme Corp"`, `"#ff0000"`, `"0.9"`,
+`"browser.click"`. An unquoted `0.9` fails with `unexpected character "."`. Single or double quotes both work; escapes are `\n \t \\ \" \'`.
 Negative numbers are allowed.
 
 **Comparison operators** (`field=(op=value)`):

@@ -41,6 +41,7 @@ Users[7#1] parent=3 children=[] "Elena" "elena@acme.io"
 - [Getting started (5 minutes)](#getting-started-5-minutes)
 - [More examples](#more-examples)
 - [Using it from other languages (REST)](#using-it-from-other-languages-rest)
+- [AI agents: traces, flows and memory](#ai-agents-traces-flows-and-memory)
 - [How the file works](#how-the-file-works)
 - [How it compares](#how-it-compares)
 - [Where BasalDB fits](#where-basaldb-fits)
@@ -171,8 +172,10 @@ commit 9 on main |  |  |
 the whole file. You can leave out attributes (they become `""`).
 
 > **Quoting tip:** wrap the whole statement in single quotes and the
-> values in double quotes. Values without spaces don't need quotes
-> (`role=admin`).
+> values in double quotes. Only plain words and whole numbers can go
+> unquoted (`role=admin`, `id=3`). Anything with spaces, dots or symbols
+> needs quotes, including decimals (`"0.9"`) and dotted names
+> (`"browser.click"`).
 
 ### 3. Query
 
@@ -335,6 +338,113 @@ to read from a branch. See [CLI.md](CLI.md#rest-api-basald).
 
 ---
 
+## AI agents: traces, flows and memory
+
+Agent data is naturally a tree, and agents need the things BasalDB is
+built around: a record of who did what and why, cheap "try it and throw
+it away" copies, and clean deletion.
+
+| Agent need | BasalDB feature |
+|---|---|
+| Runs are trees: session → task → step → tool call | layers + `->` paths, no joins |
+| "Which agent wrote this, and why?" | `-author` / `-summary` / `-reason` on every write, kept in an append-only log |
+| Try a plan, keep or drop it | branches: retry on a branch while `main` keeps the original run |
+| Forget a user or a run completely | `DELETE` removes the whole subtree in one step |
+| Portable, per-user or per-agent state | one `.bsl` file per user/agent: copy it, ship it, delete it |
+| Inspect a run without tooling | the commit log is plain text (`strings run.bsl`) |
+
+### Agent traces and flows
+
+Record each run as **session → task → step**, stamping each step with the
+agent that took it and why:
+
+```console
+$ basal init -file agent.bsl -layers "0:Sessions(goal,user),1:Tasks(title,status),2:Steps(tool,input,status)"
+$ basal query -file agent.bsl 'CREATE Sessions [goal="Book a flight to NYC",user="u_42"]'
+$ basal query -file agent.bsl 'CREATE Tasks PARENT Sessions[id=1] [title="Search flights",status="running"]'
+
+$ basal query -file agent.bsl -author "planner-agent" -summary "open search page" -reason "need options under 400 USD" \
+    'CREATE Steps PARENT Tasks[id=2] [tool="browser.navigate",input="kayak.com/flights/SFO-NYC",status="ok"]'
+$ basal query -file agent.bsl -author "planner-agent" -summary "sort by price" -reason "cheapest first" \
+    'CREATE Steps PARENT Tasks[id=2] [tool="browser.click",input="#sort-price",status="error"]'
+
+# what failed in this session?
+$ basal query -file agent.bsl 'GET Sessions[id=1] -> Tasks -> Steps[tool,input,status][status="error"]'
+Steps[4#1] parent=2 children=[] "browser.click" "#sort-price" "error"
+```
+
+**Retry on a branch.** The failed attempt stays on `main` as evidence,
+and the retry happens in isolation:
+
+```console
+$ basal branch create attempt-2 -file agent.bsl -author "planner-agent" -summary "retry" -reason "selector failed"
+$ basal query -file agent.bsl -branch attempt-2 'UPDATE Steps[status="error"][input="button[aria-label=Sort]",status="ok"]'
+$ basal query -file agent.bsl -branch attempt-2 'GET Steps[tool,status]'
+Steps[3#0] parent=2 children=[] "browser.navigate" "ok"
+Steps[4#1] parent=2 children=[] "browser.click" "ok"
+```
+
+The log reads like a run transcript:
+
+```
+[Commit:0004]
+Branch: main
+Author: planner-agent
+Reason: need options under 400 USD
+Summary: open search page
+Ops:
+  CREATE Steps#0 id=3 parent=2
+```
+
+This works well for browser-automation and tool-calling agents
+(run → page → action → result) and for multi-step workflows where you
+want to replay or audit what happened.
+
+### Agent memory
+
+Organize long-term memory as **user → project → topic → fact**, with the
+provenance of each fact recorded:
+
+```console
+$ basal init -file mem.bsl -layers "0:Users(name),1:Projects(name),2:Topics(name),3:Facts(text,source,confidence)"
+$ basal query -file mem.bsl 'CREATE Users [name="u_42"]'
+$ basal query -file mem.bsl 'CREATE Projects PARENT Users[name="u_42"] [name="travel"]'
+$ basal query -file mem.bsl 'CREATE Topics PARENT Projects[name="travel"] [name="preferences"]'
+$ basal query -file mem.bsl -author "memory-agent" -summary "learned preference" -reason "user said so in session 1" \
+    'CREATE Facts PARENT Topics[name="preferences"] [text="Prefers aisle seats",source="session:1",confidence="0.9"]'
+
+# recall: everything confident about this user's travel
+$ basal query -file mem.bsl 'GET Users[name="u_42"] -> Projects[name="travel"] -> Topics -> Facts[text,confidence][confidence=(gte="0.8")]'
+Facts[4#0] parent=3 children=[] "Prefers aisle seats" "0.9"
+
+# "forget me": the user's whole memory tree, in one step
+$ basal query -file mem.bsl 'DELETE Users[name="u_42"]'
+cascade deleted 4 record(s) under 1 root(s) in "Users"
+```
+
+**Patterns that work well**
+- **One file per user or agent.** Memory is portable and isolated, and
+  deleting it for privacy means deleting a file.
+- **Pair with a vector index for recall.** BasalDB has no similarity
+  search. Store embeddings in a vector store keyed by the BasalDB record
+  `id`; BasalDB holds the structure and provenance.
+- **Use branches for speculative memory.** Let an agent write
+  "hypotheses" on a branch and keep only what's confirmed.
+
+**Current gaps for agent workloads:** only one process can write to a
+file at a time, so give each agent its own file or route writes through
+`basald` ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+Branches can't be merged back yet
+([#20](https://github.com/Davidjustice28/basildb/issues/20)), and there's
+no text search ([#10](https://github.com/Davidjustice28/basildb/issues/10)),
+moving records ([#15](https://github.com/Davidjustice28/basildb/issues/15))
+or reading past states
+([#21](https://github.com/Davidjustice28/basildb/issues/21)). Depth is
+fixed by the layer stack, so pick it to match your trace or memory
+shape.
+
+---
+
 ## How the file works
 
 A `.bsl` file has three parts:
@@ -386,6 +496,9 @@ crunching → DuckDB.**
 
 ## Where BasalDB fits
 
+* **AI agent traces and memory.** Sessions → tasks → steps, or users →
+  topics → facts, with who/why on every write, branches for retries,
+  and one-step "forget". See [AI agents](#ai-agents-traces-flows-and-memory).
 * **Multi-tenant SaaS.** One customer, one file. Exporting a customer is
   a file copy; deleting one is deleting a file.
 * **Design and canvas tools.** Pages hold frames, frames hold shapes.
