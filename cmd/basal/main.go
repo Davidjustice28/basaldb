@@ -21,8 +21,8 @@ Usage:
   basal init    -file DATA.bsl -layers 0:Accounts,1:Teams,2:Users [-author A -summary S -reason R]
   basal inspect -file DATA.bsl [-branch NAME] [-header] [-json]
   basal query   -file DATA.bsl [-branch NAME] [-author A -summary S -reason R] 'BQL STATEMENT'
-  basal branch  -file DATA.bsl list
-  basal branch  -file DATA.bsl create NAME [-from SRC] [-author A -summary S -reason R]
+  basal branch  list -file DATA.bsl
+  basal branch  create NAME -file DATA.bsl [-from SRC] [-author A -summary S -reason R]
 
 BQL examples:
   GET Accounts[0] -> Teams -> Users
