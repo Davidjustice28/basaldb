@@ -7,11 +7,10 @@ import (
 // CascadeDelete invalidates the subtree rooted at (layerName, id) using the
 // matrix cascade engine: the target record's child pointer array is read,
 // then validity bits are flipped top-down across the slotted pages of each
-// layer height with word-parallel bitmask range writes. There is no
-// recursive tuple or secondary-index sweep: because children occupy
-// contiguous X slots of the layer below, each level of the tree costs a
-// constant number of range-mask operations, independent of the number of
-// indexes or tables a relational engine would have to visit.
+// layer height with word-parallel bitmask range writes, and the affected
+// id-index entries are dropped by id. Cost is O(subtree): the walk visits
+// every descendant once and every index entry is removed directly, with no
+// per-entry scan of the layer.
 //
 // The deletion is recorded in the commit block (Author, Summary,
 // Reason) and replayed deterministically from the journal after a crash.
@@ -48,8 +47,10 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 	visited := map[ref]bool{}
 	level := []ref{{layer, id}}
 	visited[level[0]] = true
-	// Slots to invalidate, grouped per layer for contiguous range flips.
+	// Slots and ids to invalidate, grouped per layer for contiguous range
+	// flips and direct id-index drops.
 	perLayer := map[int][]uint64{}
+	perLayerIDs := map[int][]uint64{}
 	deleted := 0
 
 	for len(level) > 0 {
@@ -60,6 +61,7 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 				continue
 			}
 			perLayer[cur.layer] = append(perLayer[cur.layer], rec.Slot)
+			perLayerIDs[cur.layer] = append(perLayerIDs[cur.layer], rec.ID)
 			deleted++
 			if cur.layer+1 > len(e.hdr.Layers)-1 && len(rec.Children) > 0 {
 				// Children must live at height+1; a missing layer means
@@ -109,12 +111,10 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 		if ls == nil {
 			continue
 		}
-		for _, s := range slots {
-			for id, x := range ls.idIndex {
-				if x == s {
-					delete(ls.idIndex, id)
-				}
-			}
+		// The BFS already collected every deleted id at this height, so
+		// index cleanup is a direct map delete per record: O(subtree).
+		for _, id := range perLayerIDs[height] {
+			delete(ls.idIndex, id)
 		}
 	}
 	return deleted, nil

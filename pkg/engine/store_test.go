@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -331,6 +332,131 @@ func TestCommitLogRegionCarriesAuditMetadata(t *testing.T) {
 	}
 	if !strings.Contains(text, "Author: Elena <elena@dev.io>") {
 		t.Errorf("commit log text missing author:\n%s", text)
+	}
+}
+
+// A close with no journal records since the last checkpoint must not
+// rewrite or replace the container file (issue #32: read-only CLI calls
+// gave the file a new inode and paid a full rewrite on every invocation).
+func TestCleanCloseDoesNotRewriteContainer(t *testing.T) {
+	path := t.TempDir() + "/clean.bsl"
+	db, err := Init(path, []Layer{{Height: 0, Name: "Accounts"}}, testMeta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Init bootstraps through the journal, so this first Close checkpoints.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := db2.Snapshot(DefaultBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := snap.Count(0); n != 0 {
+		t.Fatalf("accounts = %d, want 0", n)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Error("clean close replaced the container file (new inode)")
+	}
+}
+
+// A close after writes still folds the journal into the page region, and
+// the reopened container recovers the committed state.
+func TestDirtyCloseCheckpoints(t *testing.T) {
+	path := t.TempDir() + "/dirty.bsl"
+	db, err := Init(path, []Layer{{Height: 0, Name: "Accounts"}}, testMeta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(DefaultBranch, testMeta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Create("Accounts", 0, []string{"Acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	snap, err := db2.Snapshot(DefaultBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := snap.Count(0); n != 1 {
+		t.Errorf("accounts after dirty close = %d, want 1", n)
+	}
+}
+
+// Once the journal passes ckptThreshold bytes, the commit folds it into
+// the page region so replay on open stays bounded (issue #32).
+func TestCommitAutoCheckpointsAtThreshold(t *testing.T) {
+	path := t.TempDir() + "/thresh.bsl"
+	db, err := Init(path, []Layer{{Height: 0, Name: "Accounts"}}, testMeta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2.ckptThreshold = 1 // fold the journal on every commit
+	tx, err := db2.Begin(DefaultBranch, testMeta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Create("Accounts", 0, []string{"Acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db2.journalOff != db2.hdr.JournalStart {
+		t.Errorf("journal not folded after commit: off=%d, JournalStart=%d",
+			db2.journalOff, db2.hdr.JournalStart)
+	}
+	if err := db2.Close(); err != nil { // clean now: no rewrite
+		t.Fatal(err)
+	}
+
+	db3, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db3.Close()
+	snap, err := db3.Snapshot(DefaultBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := snap.Count(0); n != 1 {
+		t.Errorf("accounts after auto-checkpoint reopen = %d, want 1", n)
 	}
 }
 

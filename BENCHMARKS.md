@@ -69,6 +69,33 @@ SQLite with the same data (indexed foreign keys, separate `sqlite3`
 process per call) takes 10–23 ms per call, loads in 177 ms and uses 11 MB
 on disk.
 
+## Update: 2026-10-14 — #32 and #35 fixed
+
+Same benchmark, Apple M1 (8 cores), Go 1.21.3: old binary built at
+`f19c089` vs the fixed tree, measured back-to-back on the same machine,
+fan-out 10 x 20 (211k records):
+
+| | old (`f19c089`) | fixed | |
+|---|---|---|---|
+| `DELETE Accounts[id=N]` (211 records) | 396 ms | 9.2 ms | 43x |
+| `DELETE Teams[id=N]` (~21 records) | 49 ms | 11 ms | 4.6x |
+| `basal query 'SHOW LAYERS'` (CLI, read-only) | 460-630 ms | ~200 ms | 2.5x |
+| CLI read-only call rewrites the file | yes (new inode every call) | no (inode stable) | #32 |
+| Bulk load | 45.9k rec/s | 39.5k rec/s | -14% |
+
+- **#35:** cascade delete now drops id-index entries directly from the
+  breadth-first walk (O(subtree)) instead of rescanning the layer once
+  per deleted record. The remaining ~10 ms is commit-path cost (#34),
+  not the cascade.
+- **#32:** a clean close no longer checkpoints, so read-only CLI calls
+  leave the file byte-for-byte untouched (same inode, no rename). Writes
+  still append to the journal; once it passes 8 MiB the next commit
+  folds it into the page region, keeping replay on open bounded. The
+  bulk-load dip is that periodic checkpointing; ingest throughput is
+  tracked in #39.
+- The CLI's remaining ~200 ms is loading the whole file into RAM per
+  call (#37), not rewriting it.
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
@@ -77,8 +104,10 @@ on disk.
   work requested:
   - each transaction copies every layer's index (#34)
   - lookups never use the id index (#33)
-  - cascade delete rescans the index once per deleted record (#35)
-  - every CLI call rewrites the whole file (#32)
+  - cascade delete rescans the index once per deleted record (#35,
+    fixed 2026-10-14: O(subtree), see update above)
+  - every CLI call rewrites the whole file (#32, fixed 2026-10-14: a
+    clean close no longer checkpoints)
 - **Memory and storage:** the whole database lives in RAM (#37), and
   each branch adds a near-full copy on disk (#36).
 

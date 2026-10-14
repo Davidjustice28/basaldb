@@ -47,6 +47,9 @@ func (t token) String() string {
 	case tokIdent:
 		return t.text
 	case tokNumber:
+		if t.text != "" {
+			return t.text
+		}
 		return strconv.FormatUint(t.num, 10)
 	case tokString:
 		return strconv.Quote(t.text)
@@ -125,23 +128,57 @@ func lex(input string) ([]token, error) {
 			toks = append(toks, token{kind: tokString, text: s, pos: i})
 			i = next
 		case c >= '0' && c <= '9',
-			c == '-' && i+1 < len(input) && input[i+1] >= '0' && input[i+1] <= '9':
-			j := i + 1
+			c == '-' && i+1 < len(input) && input[i+1] >= '0' && input[i+1] <= '9',
+			c == '.' && i+1 < len(input) && input[i+1] >= '0' && input[i+1] <= '9':
+			// num holds the magnitude of an integral literal; a leading
+			// '-' stays in text so consumers that support signed values
+			// (filter comparisons) can re-parse, while selectors can
+			// reject it explicitly. Fractional and exponent forms
+			// (0.9, -1.5, .5, 1e3, 2.5E-2) keep their full text and leave
+			// num at 0: they are values, never slot or index selectors.
+			start := i
+			j := i
+			if c == '-' {
+				j++
+			}
 			for j < len(input) && input[j] >= '0' && input[j] <= '9' {
 				j++
 			}
-			// num holds the magnitude; a leading '-' stays in text so
-			// consumers that support signed values (filter comparisons)
-			// can re-parse, while selectors can reject it explicitly.
-			start := i
-			if c == '-' {
-				start = i + 1
+			isFloat := false
+			if j+1 < len(input) && input[j] == '.' && input[j+1] >= '0' && input[j+1] <= '9' {
+				isFloat = true
+				j++
+				for j < len(input) && input[j] >= '0' && input[j] <= '9' {
+					j++
+				}
 			}
-			n, err := strconv.ParseUint(input[start:j], 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("bql: bad number %q at %d", input[i:j], i)
+			if j < len(input) && (input[j] == 'e' || input[j] == 'E') {
+				k := j + 1
+				if k < len(input) && (input[k] == '+' || input[k] == '-') {
+					k++
+				}
+				if k < len(input) && input[k] >= '0' && input[k] <= '9' {
+					isFloat = true
+					j = k
+					for j < len(input) && input[j] >= '0' && input[j] <= '9' {
+						j++
+					}
+				}
 			}
-			toks = append(toks, token{kind: tokNumber, num: n, text: input[i:j], pos: i})
+			text := input[start:j]
+			var n uint64
+			if !isFloat {
+				mag := text
+				if c == '-' {
+					mag = text[1:]
+				}
+				var err error
+				n, err = strconv.ParseUint(mag, 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("bql: bad number %q at %d", text, i)
+				}
+			}
+			toks = append(toks, token{kind: tokNumber, num: n, text: text, pos: start})
 			i = j
 		case isIdentStart(rune(c)):
 			j := i
@@ -151,7 +188,7 @@ func lex(input string) ([]token, error) {
 			toks = append(toks, token{kind: tokIdent, text: input[i:j], pos: i})
 			i = j
 		default:
-			return nil, fmt.Errorf("bql: unexpected character %q at %d", string(c), i)
+			return nil, fmt.Errorf("bql: unexpected character %q at %d; quote the value: \"...\"", string(c), i)
 		}
 	}
 	toks = append(toks, token{kind: tokEOF, pos: len(input)})
@@ -192,8 +229,13 @@ func isIdentStart(r rune) bool {
 	return unicode.IsLetter(r) || r == '_'
 }
 
+// isIdentPart accepts the characters that may appear inside a bare word.
+// '.', '/', ':' and '@' are included so values like browser.click,
+// session:1, a@b.io or a/path lex unquoted; '-' is deliberately excluded
+// so "->" (path step) and negative numbers still tokenize.
 func isIdentPart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' ||
+		r == '.' || r == '/' || r == ':' || r == '@'
 }
 
 // keyword compares an identifier case-insensitively.
