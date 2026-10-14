@@ -35,7 +35,7 @@ Defaults (flags always win):
 BQL examples:
   GET Accounts[id=0] -> Teams -> Users
   GET Users[Name,Age][Age=(gt=21)][limit=5,sort=desc]
-  CREATE Users PARENT Teams[id=101] ("Sam", "sam@dev.io")
+  CREATE Users PARENT Teams[id=101] [name="Sam",email="sam@dev.io"]
   DELETE Accounts[id=1]
   SHOW COMMITS
 `

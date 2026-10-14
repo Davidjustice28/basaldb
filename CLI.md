@@ -28,7 +28,7 @@ initial commit: 1 (basal <basal@localhost> | Database initialized | manual initi
 
 $ basal query -file demo.bsl \
     -author "Alex Rivera <alex@dev.io>" -summary "seed data" -reason "quickstart" \
-    'CREATE Accounts ("Acme Corp", "2026-01-01")'
+    'CREATE Accounts [name="Acme Corp",date="2026-01-01"]'
 layer | id | slot | parent | children | attrs
 Accounts[1#0] parent=0 children=[] "Acme Corp" "2026-01-01"
 created Accounts#0 (id=1)
@@ -36,7 +36,7 @@ commit 2 on main | Alex Rivera <alex@dev.io> | seed data | quickstart
 
 $ basal query -file demo.bsl \
     -author "Alex Rivera <alex@dev.io>" -summary "seed data" -reason "quickstart" \
-    'CREATE Teams PARENT Accounts[id=1] ("Eng Team")'
+    'CREATE Teams PARENT Accounts[id=1] [name="Eng Team"]'
 layer | id | slot | parent | children | attrs
 Teams[2#0] parent=1 children=[] "Eng Team"
 created Teams#0 (id=2)
@@ -44,7 +44,7 @@ commit 3 on main | Alex Rivera <alex@dev.io> | seed data | quickstart
 
 $ basal query -file demo.bsl \
     -author "Alex Rivera <alex@dev.io>" -summary "seed data" -reason "quickstart" \
-    'CREATE Users PARENT Teams[id=2] ("Sam", "sam@dev.io")'
+    'CREATE Users PARENT Teams[id=2] [name="Sam",email="sam@dev.io"]'
 layer | id | slot | parent | children | attrs
 Users[3#0] parent=2 children=[] "Sam" "sam@dev.io"
 created Users#0 (id=3)
@@ -78,8 +78,9 @@ structural operations like `BRANCH CREATE` require them. See
   `1:Teams`, `2:Users` stack above it (the README's diagram draws
   children above parents). `-layers` declares the stack at `init`;
   queries walk it with `->`.
-* **Attributes** — each record stores a positional list of strings
-  (`("Acme Corp", "2026-01-01")`). Optionally declare names per layer
+* **Attributes** — each record stores a positional list of strings, set
+  with a bracket of `field=value` pairs (`[name="Acme Corp",date="2026-01-01"]`).
+  Optionally declare names per layer
   at init (`0:Accounts(name,date)`); then queries can use `name=`
   filters and `[name,date]` column lists instead of raw indexes. Names
   are case-insensitive.
@@ -350,17 +351,21 @@ message explaining the `-layers` declaration; positional references
 #### CREATE — root records and children
 
 ```
-CREATE Layer ("attr", "attr", ...)
-CREATE Layer PARENT Layer[filters] ("attr", "attr", ...)
+CREATE Layer [field=value, ...]
+CREATE Layer PARENT Layer[filters] [field=value, ...]
 ```
 
-Without `PARENT` the record roots its own subtree; with it the filters
-must resolve to exactly **one** existing record:
+The attribute bracket uses the same `field=value` pairs as filters —
+by declared name (`name="Sam"`) or positional index (`0="Sam"`) — so
+`CREATE`, `UPDATE`, `DELETE`, and `GET` all share one bracket syntax.
+Values are stored as strings. Without `PARENT` the record roots its own
+subtree; with it the filters must resolve to exactly **one** existing
+record:
 
 ```console
 $ basal query -file demo.bsl \
     -author "Alex Rivera <alex@dev.io>" -summary "seed tenants" -reason "demo data" \
-    'CREATE Accounts ("Acme Corp", "2026-01-01")'
+    'CREATE Accounts [name="Acme Corp",date="2026-01-01"]'
 layer | id | slot | parent | children | attrs
 Accounts[1#0] parent=0 children=[] "Acme Corp" "2026-01-01"
 created Accounts#0 (id=1)
@@ -368,33 +373,35 @@ commit 2 on main | Alex Rivera <alex@dev.io> | seed tenants | demo data
 
 $ basal query -file demo.bsl \
     -author "Alex Rivera <alex@dev.io>" -summary "seed tenants" -reason "demo data" \
-    'CREATE Teams PARENT Accounts[id=1] ("Eng Team")'
+    'CREATE Teams PARENT Accounts[id=1] [name="Eng Team"]'
 created Teams#0 (id=2)
 ```
 
 The engine assigns IDs and slots; the CLI output shows both
 (`Layer[id#slot]`).
 
-#### UPDATE — replace attributes
+#### UPDATE — set attributes
 
 ```
-UPDATE Layer[filters] ("attr", "attr", ...)
+UPDATE Layer[filters][field=value, ...]
 ```
 
-Replaces the full attribute list of every record matching the filters in
-one commit. No filters means every record in the layer. Zero matches is
-an error, never a silent no-op:
+The first bracket picks the records, the second sets their attributes —
+the same bracket pairs as every other statement. Only the attributes
+you list change; the rest keep their values (like SQL's
+`UPDATE ... SET`). No filters means every record in the layer. Zero
+matches is an error, never a silent no-op:
 
 ```console
 $ basal query -file demo.bsl \
     -author "Sam <sam@dev.io>" -summary "rename" -reason "demo" \
-    'UPDATE Users[slot=0] ("Sam Rivera", "sam@dev.io")'
+    'UPDATE Users[slot=0][name="Sam Rivera"]'
 layer | id | slot | parent | children | attrs
 Users[3#0] parent=2 children=[] "Sam Rivera" "sam@dev.io"
 updated 1 record(s) in "Users"
 
 $ basal query -file demo.bsl \
-    -author A -summary S -reason R 'UPDATE Users[id=99] ("Ghost")'
+    -author A -summary S -reason R 'UPDATE Users[id=99][name="Ghost"]'
 basal: bql: no records in "Users" matched [id=99]
 ```
 

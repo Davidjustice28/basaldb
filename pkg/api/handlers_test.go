@@ -47,7 +47,7 @@ func TestQueryAndExecute(t *testing.T) {
 
 	// Write through /v1/execute with mandatory audit metadata.
 	resp := post(t, srv, "/v1/execute", map[string]string{
-		"statement": `CREATE Accounts ("Acme Corp")`,
+		"statement": `CREATE Accounts [0="Acme Corp"]`,
 		"author":    "Alex Rivera <alex@dev.io>",
 		"summary":   "seed account",
 		"reason":    "api test",
@@ -70,7 +70,7 @@ func TestQueryAndExecute(t *testing.T) {
 	}
 
 	// Record writes are metadata-free; the commit block carries none.
-	resp = post(t, srv, "/v1/execute", map[string]string{"statement": `CREATE Accounts ("X")`})
+	resp = post(t, srv, "/v1/execute", map[string]string{"statement": `CREATE Accounts [0="X"]`})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("metadata-less write status = %d, want 200", resp.StatusCode)
 	}
@@ -157,7 +157,7 @@ func TestBranchesEndpoint(t *testing.T) {
 
 	// Writes on the feature branch must not leak into main.
 	resp = post(t, srv, "/v1/execute?branch=feature", map[string]string{
-		"statement": `CREATE Accounts ("Feature Co")`,
+		"statement": `CREATE Accounts [0="Feature Co"]`,
 		"author":    "Dev", "summary": "add", "reason": "test",
 	})
 	resp.Body.Close()
@@ -180,7 +180,7 @@ func TestBranchesEndpoint(t *testing.T) {
 func TestCommitsEndpointCarriesAuditMetadata(t *testing.T) {
 	srv := newTestServer(t)
 	resp := post(t, srv, "/v1/execute", map[string]string{
-		"statement": `CREATE Accounts ("Audited")`,
+		"statement": `CREATE Accounts [0="Audited"]`,
 		"author":    "Elena <elena@dev.io>",
 		"summary":   "add audited account",
 		"reason":    "compliance",

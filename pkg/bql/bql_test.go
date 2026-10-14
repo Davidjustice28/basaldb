@@ -51,15 +51,27 @@ func TestParseMutationsAndBranches(t *testing.T) {
 		q    string
 		want Statement
 	}{
-		{`CREATE Users PARENT Teams[id=101] ("Sam", "sam@dev.io")`,
-			&CreateStmt{Layer: "Users", Parent: &RecordRef{Layer: "Teams", Filters: []Filter{{Field: "id", Op: OpEq, Value: "101"}}}, Attrs: []string{"Sam", "sam@dev.io"}}},
-		{`UPDATE Users[id=1001] ("Alex R", "alex@dev.io")`,
-			&UpdateStmt{Target: RecordRef{Layer: "Users", Filters: []Filter{{Field: "id", Op: OpEq, Value: "1001"}}}, Attrs: []string{"Alex R", "alex@dev.io"}}},
-		{`UPDATE Users[Name=David,Age=(gt=21)] ("D")`,
-			&UpdateStmt{Target: RecordRef{Layer: "Users", Filters: []Filter{{Field: "Name", Op: OpEq, Value: "David"}, {Field: "Age", Op: OpGt, Value: "21"}}}, Attrs: []string{"D"}}},
+		{`CREATE Users PARENT Teams[id=101] [name="Sam",email="sam@dev.io"]`,
+			&CreateStmt{Layer: "Users", Parent: &RecordRef{Layer: "Teams", Filters: []Filter{{Field: "id", Op: OpEq, Value: "101"}}}, Rows: [][]Assignment{{{Field: "name", Value: "Sam"}, {Field: "email", Value: "sam@dev.io"}}}}},
+		// Multi-row CREATE: one assignment bracket per new record, one commit.
+		{`CREATE Users [name="Sam"] [name="Ada"] [name="Linus"]`,
+			&CreateStmt{Layer: "Users", Rows: [][]Assignment{{{Field: "name", Value: "Sam"}}, {{Field: "name", Value: "Ada"}}, {{Field: "name", Value: "Linus"}}}}},
+		{`UPDATE Users[id=1001][name="Alex R",email="alex@dev.io"]`,
+			&UpdateStmt{Target: RecordRef{Layer: "Users", Filters: []Filter{{Field: "id", Op: OpEq, Value: "1001"}}}, Assignments: []Assignment{{Field: "name", Value: "Alex R"}, {Field: "email", Value: "alex@dev.io"}}}},
+		{`UPDATE Users[Name=David,Age=(gt=21)][name=D]`,
+			&UpdateStmt{Target: RecordRef{Layer: "Users", Filters: []Filter{{Field: "Name", Op: OpEq, Value: "David"}, {Field: "Age", Op: OpGt, Value: "21"}}}, Assignments: []Assignment{{Field: "name", Value: "D"}}}},
+		// UPDATE with repeated filter brackets (AND) + trailing sort/limit modifier.
+		{`UPDATE Users[region=emea][active=yes][limit=10,sort=asc][name="X"]`,
+			&UpdateStmt{Target: RecordRef{Layer: "Users", Filters: []Filter{{Field: "region", Op: OpEq, Value: "emea"}, {Field: "active", Op: OpEq, Value: "yes"}}}, Assignments: []Assignment{{Field: "name", Value: "X"}}, Modifiers: MutationModifiers{Limit: 10, Sort: "asc"}}},
+		// Positional assignments and attribute-less creates parse too.
+		{`CREATE Accounts [0="Acme",2="2026"]`,
+			&CreateStmt{Layer: "Accounts", Rows: [][]Assignment{{{Field: "0", Value: "Acme"}, {Field: "2", Value: "2026"}}}}},
 		{`DELETE Accounts[id=1]`, &DeleteStmt{Target: RecordRef{Layer: "Accounts", Filters: []Filter{{Field: "id", Op: OpEq, Value: "1"}}}}},
 		{`DELETE Accounts[region=emea]`, &DeleteStmt{Target: RecordRef{Layer: "Accounts", Filters: []Filter{{Field: "region", Op: OpEq, Value: "emea"}}}}},
 		{`DELETE Users[*]`, &DeleteStmt{Target: RecordRef{Layer: "Users"}}},
+		// DELETE with sort/limit modifier bracket.
+		{`DELETE Accounts[stale=yes][sort=desc][limit=1]`,
+			&DeleteStmt{Target: RecordRef{Layer: "Accounts", Filters: []Filter{{Field: "stale", Op: OpEq, Value: "yes"}}}, Modifiers: MutationModifiers{Limit: 1, Sort: "desc"}}},
 		{`SHOW LAYERS`, &ShowStmt{Kind: "LAYERS"}},
 		{`show records Users`, &ShowStmt{Kind: "RECORDS", Layer: "Users"}},
 		{`BRANCH LIST`, &BranchStmt{Action: "LIST"}},
@@ -82,15 +94,15 @@ func equalStmt(a, b Statement) bool {
 	switch x := a.(type) {
 	case *CreateStmt:
 		y, ok := b.(*CreateStmt)
-		return ok && x.Layer == y.Layer && sameAttrs(x.Attrs, y.Attrs) &&
+		return ok && x.Layer == y.Layer && sameRows(x.Rows, y.Rows) &&
 			((x.Parent == nil) == (y.Parent == nil)) &&
 			(x.Parent == nil || sameRef(*x.Parent, *y.Parent))
 	case *UpdateStmt:
 		y, ok := b.(*UpdateStmt)
-		return ok && sameRef(x.Target, y.Target) && sameAttrs(x.Attrs, y.Attrs)
+		return ok && sameRef(x.Target, y.Target) && sameAssigns(x.Assignments, y.Assignments) && x.Modifiers == y.Modifiers
 	case *DeleteStmt:
 		y, ok := b.(*DeleteStmt)
-		return ok && sameRef(x.Target, y.Target)
+		return ok && sameRef(x.Target, y.Target) && x.Modifiers == y.Modifiers
 	case *ShowStmt:
 		y, ok := b.(*ShowStmt)
 		return ok && x.Kind == y.Kind && x.Layer == y.Layer
@@ -101,12 +113,24 @@ func equalStmt(a, b Statement) bool {
 	return false
 }
 
-func sameAttrs(a, b []string) bool {
+func sameAssigns(a, b []Assignment) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameRows(a, b [][]Assignment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !sameAssigns(a[i], b[i]) {
 			return false
 		}
 	}
@@ -134,9 +158,14 @@ func TestParseErrors(t *testing.T) {
 		`GET "Users"`,
 		`SHOW TABLES`,
 		`BRANCH DELETE dev`,
-		`CREATE Users PARENT Teams[id=1] ("x") EXTRA`,
+		`CREATE Users PARENT Teams[id=1] ("x") EXTRA`, // old paren lists are gone
 		`CREATE Users ("unterminated)`,
 		`UPDATE Users[1] ("x")`,
+		`UPDATE Users[id=1]`,                // no attribute bracket
+		`UPDATE Users[id=1][]`,              // empty attribute bracket
+		`UPDATE Users[id=1][name=A,name=B]`, // duplicate assignment
+		`CREATE Users [name]`,               // assignment without a value
+		`CREATE Users [name=(gt=1)]`,        // comparison operator in an assignment
 		`DELETE Accounts[1]`,
 		`DELETE Accounts[#1]`,
 		`GET Accounts[0] ->`,
@@ -166,14 +195,14 @@ func setupDB(t *testing.T) (*engine.DB, *ExecContext) {
 		Branch: engine.DefaultBranch,
 		Meta:   engine.TxMeta{Author: "Alex Rivera <alex@dev.io>", Summary: "seed", Reason: "bql tests"},
 	}
-	mustExec(t, ctx, `CREATE Accounts ("Acme Corp", "2026-01-01")`)
-	mustExec(t, ctx, `CREATE Accounts ("Stark Ind", "2026-02-15")`)
-	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=1] ("Eng Team")`)
-	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=1] ("Sales Team")`)
-	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=2] ("R&D Team")`)
-	mustExec(t, ctx, `CREATE Users PARENT Teams[id=3] ("Alex", "alex@dev.io")`)
-	mustExec(t, ctx, `CREATE Users PARENT Teams[id=3] ("Elena", "elena@dev.io")`)
-	mustExec(t, ctx, `CREATE Users PARENT Teams[id=5] ("Tony", "tony@stark.io")`)
+	mustExec(t, ctx, `CREATE Accounts [0="Acme Corp",1="2026-01-01"]`)
+	mustExec(t, ctx, `CREATE Accounts [0="Stark Ind",1="2026-02-15"]`)
+	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=1] [0="Eng Team"]`)
+	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=1] [0="Sales Team"]`)
+	mustExec(t, ctx, `CREATE Teams PARENT Accounts[id=2] [0="R&D Team"]`)
+	mustExec(t, ctx, `CREATE Users PARENT Teams[id=3] [0=Alex,1="alex@dev.io"]`)
+	mustExec(t, ctx, `CREATE Users PARENT Teams[id=3] [0=Elena,1="elena@dev.io"]`)
+	mustExec(t, ctx, `CREATE Users PARENT Teams[id=5] [0=Tony,1="tony@stark.io"]`)
 	return db, ctx
 }
 
@@ -225,7 +254,7 @@ func TestExecGetPathLayerMustBeAdjacent(t *testing.T) {
 
 func TestExecUpdateAndCommitMetadata(t *testing.T) {
 	db, ctx := setupDB(t)
-	res := mustExec(t, ctx, `UPDATE Users[id=6] ("Alex Rivera", "alex@dev.io")`)
+	res := mustExec(t, ctx, `UPDATE Users[id=6][0="Alex Rivera",1="alex@dev.io"]`)
 	if res.Commit == nil {
 		t.Fatal("write result carries no commit block")
 	}
@@ -255,19 +284,82 @@ func TestExecDeleteCascade(t *testing.T) {
 	}
 }
 
+func TestExecCreateMultiRowAutoIDs(t *testing.T) {
+	db, ctx := setupDB(t)
+
+	// Three rows, one bracket each, all in one commit; ids auto-assign in
+	// row order and never collide with the pre-seeded records.
+	res := mustExec(t, ctx, `CREATE Users [0="Sam",1="sam@dev.io"] [0="Ada",1="ada@dev.io"] [0="Linus",1="linus@dev.io"]`)
+	if len(res.Rows) != 3 {
+		t.Fatalf("multi-row CREATE returned %d rows, want 3 (%+v)", len(res.Rows), res.Rows)
+	}
+	seen := map[uint64]bool{}
+	want := []string{"Sam", "Ada", "Linus"}
+	for i, r := range res.Rows {
+		if seen[r.ID] {
+			t.Errorf("duplicate auto-assigned id %d", r.ID)
+		}
+		seen[r.ID] = true
+		if r.Attrs[0] != want[i] {
+			t.Errorf("row %d attrs = %v, want %q first", i, r.Attrs, want[i])
+		}
+	}
+	snap, _ := db.Snapshot(engine.DefaultBranch)
+	if got := len(snap.Records(2)); got != 6 { // 3 seeded + 3 new
+		t.Errorf("Users count = %d, want 6", got)
+	}
+}
+
+func TestExecUpdateSortLimitAndRepeatedFilters(t *testing.T) {
+	db, ctx := setupDB(t)
+
+	// Touch only the two newest users (sort=desc + limit=2), setting their
+	// email slot via a positional assignment. Repeated filter brackets AND
+	// together, so the second bracket is a redundant match on every record.
+	mustExec(t, ctx, `UPDATE Users[0=(ne="nobody")][0=(ne="nobody")][limit=2,sort=desc][1="touched@dev.io"]`)
+	snap, _ := db.Snapshot(engine.DefaultBranch)
+	touched := 0
+	for _, r := range snap.Records(2) {
+		if r.Attrs[1] == "touched@dev.io" {
+			touched++
+			if r.ID < 7 {
+				t.Errorf("sort=desc+limit=2 touched id %d, want only the two newest (>=7)", r.ID)
+			}
+		}
+	}
+	if touched != 2 {
+		t.Errorf("touched %d records, want 2", touched)
+	}
+}
+
+func TestExecDeleteSortLimit(t *testing.T) {
+	db, ctx := setupDB(t)
+
+	// Delete only the newest top-level account (Stark Ind, id=2); its
+	// subtree goes with it. Acme Corp and its family survive.
+	res := mustExec(t, ctx, `DELETE Accounts[sort=desc][limit=1]`)
+	if !strings.Contains(res.Message, "3") { // Stark Ind + R&D Team + Tony
+		t.Errorf("delete message = %q, want 3 records", res.Message)
+	}
+	snap, _ := db.Snapshot(engine.DefaultBranch)
+	if got := len(snap.Records(0)); got != 1 {
+		t.Errorf("Accounts left = %d, want 1 (Acme Corp)", got)
+	}
+}
+
 func TestExecRecordWritesDontRequireAuditMetadata(t *testing.T) {
 	_, ctx := setupDB(t)
 	ctx.Meta = engine.TxMeta{}
 
 	// Record CRUD is metadata-free; the commit block simply carries none.
-	res := mustExec(t, ctx, `CREATE Accounts ("X")`)
+	res := mustExec(t, ctx, `CREATE Accounts [0="X"]`)
 	if res.Commit == nil {
 		t.Fatal("metadata-free write produced no commit block")
 	}
 	if res.Commit.Author != "" || res.Commit.Summary != "" || res.Commit.Reason != "" {
 		t.Errorf("commit metadata = %+v, want empty", res.Commit)
 	}
-	mustExec(t, ctx, `UPDATE Accounts[id=9] ("Y")`)
+	mustExec(t, ctx, `UPDATE Accounts[id=9][0=Y]`)
 	mustExec(t, ctx, `DELETE Accounts[id=9]`)
 
 	// Structural operations still require the audit metadata.
@@ -282,7 +374,7 @@ func TestExecBranching(t *testing.T) {
 
 	featCtx := *ctx
 	featCtx.Branch = "feature"
-	mustExec(t, &featCtx, `CREATE Accounts ("Feature Co")`)
+	mustExec(t, &featCtx, `CREATE Accounts [0="Feature Co"]`)
 
 	// main is unaffected: divergence without merge.
 	res := mustExec(t, ctx, `SHOW RECORDS Accounts`)
@@ -424,11 +516,11 @@ func filterDB(t *testing.T) (*engine.DB, *ExecContext) {
 		Branch: engine.DefaultBranch,
 		Meta:   engine.TxMeta{Author: "Test <t@t.io>", Summary: "seed", Reason: "filter tests"},
 	}
-	mustExec(t, ctx, `CREATE Accounts ("Acme", "emea")`)
-	mustExec(t, ctx, `CREATE Accounts ("Globex", "amer")`)
-	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=1] ("David", "34")`)
-	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=1] ("Amy", "19")`)
-	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=2] ("Ravi", "41")`)
+	mustExec(t, ctx, `CREATE Accounts [name=Acme,region=emea]`)
+	mustExec(t, ctx, `CREATE Accounts [name=Globex,region=amer]`)
+	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=1] [name=David,age=34]`)
+	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=1] [name=Amy,age=19]`)
+	mustExec(t, ctx, `CREATE Users PARENT Accounts[id=2] [name=Ravi,age=41]`)
 	return db, ctx
 }
 
@@ -545,7 +637,7 @@ func TestExecGetUnknownAttribute(t *testing.T) {
 	defer db.Close()
 	plain := &ExecContext{DB: db, Branch: engine.DefaultBranch,
 		Meta: engine.TxMeta{Author: "Test", Summary: "seed", Reason: "tests"}}
-	mustExec(t, plain, `CREATE Accounts ("Acme")`)
+	mustExec(t, plain, `CREATE Accounts [0="Acme"]`)
 	_, err = Exec(plain, `GET Accounts[Name]`)
 	if err == nil || !strings.Contains(err.Error(), "declares no attribute names") {
 		t.Errorf("undeclared attribute error = %v", err)
@@ -578,18 +670,19 @@ func TestExecDeleteByFilterMultipleRoots(t *testing.T) {
 		t.Error("delete with no matches succeeded")
 	}
 
-	// UPDATE by attribute filter.
-	mustExec(t, ctx, `UPDATE Accounts[name=Globex] ("Globex Inc")`)
-	res = mustExec(t, ctx, `GET Accounts[name="Globex Inc"]`)
-	if len(res.Rows) != 1 {
+	// UPDATE by attribute filter; the second bracket sets, and
+	// attributes not listed keep their values (region survives).
+	mustExec(t, ctx, `UPDATE Accounts[name=Globex][name="Globex Inc"]`)
+	res = mustExec(t, ctx, `GET Accounts[name,region][name="Globex Inc"]`)
+	if len(res.Rows) != 1 || len(res.Rows[0].Attrs) != 2 || res.Rows[0].Attrs[1] != "amer" {
 		t.Errorf("update-by-filter rows = %+v", res.Rows)
 	}
 
 	// PARENT must resolve to exactly one record.
-	if _, err := Exec(ctx, `CREATE Users PARENT Accounts[name=(ne=none)] ("X")`); err == nil {
+	if _, err := Exec(ctx, `CREATE Users PARENT Accounts[name=(ne=none)] [0="X"]`); err == nil {
 		t.Error("PARENT matching many records succeeded")
 	}
-	mustExec(t, ctx, `CREATE Users PARENT Accounts[name="Globex Inc"] ("Zoe", "12")`)
+	mustExec(t, ctx, `CREATE Users PARENT Accounts[name="Globex Inc"] [name=Zoe,age=12]`)
 	res = mustExec(t, ctx, `GET Users[name=Zoe]`)
 	if len(res.Rows) != 1 || res.Rows[0].Parent != 2 {
 		t.Errorf("create under filtered parent = %+v", res.Rows)

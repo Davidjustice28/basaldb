@@ -121,6 +121,25 @@ func matchRef(tx *engine.WriteTx, ref RecordRef) ([]*engine.Record, error) {
 	return filterRecords(tx.Layers(), h, all, ref.Filters)
 }
 
+// applyMutationMods orders the matched records by id (when sort is set)
+// and caps how many are touched (when limit is set). With no modifiers
+// it returns recs unchanged.
+func applyMutationMods(recs []*engine.Record, mods MutationModifiers) []*engine.Record {
+	if mods.Sort != "" {
+		asc := mods.Sort == "asc"
+		sort.SliceStable(recs, func(i, j int) bool {
+			if asc {
+				return recs[i].ID < recs[j].ID
+			}
+			return recs[i].ID > recs[j].ID
+		})
+	}
+	if n := mods.Limit; n > 0 && len(recs) > n {
+		recs = recs[:n]
+	}
+	return recs
+}
+
 // execGet runs a path traversal (zero join) over an immutable MVCC
 // snapshot. Steps filter as they walk; the final step projects
 // attribute columns and applies limit/sort to the result.
@@ -346,8 +365,10 @@ func projectAttrs(layer engine.Layer, r *engine.Record, proj []AttrRef) ([]strin
 	return out, nil
 }
 
-// execCreate creates a record, optionally under an existing parent, in
-// one commit. Without PARENT the record roots its own subtree.
+// execCreate creates one or more records (one assignment bracket per
+// row), optionally under an existing parent, all in one commit. Without
+// PARENT each record roots its own subtree. Ids are auto-assigned in
+// row order and never collide.
 func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error) {
 	tx, err := ctx.DB.Begin(branch, ctx.Meta)
 	if err != nil {
@@ -357,7 +378,9 @@ func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error)
 		tx.Rollback()
 		return nil, err
 	}
-	if _, ok := layerHeight(tx.Layers(), s.Layer); !ok {
+	layers := tx.Layers()
+	height, ok := layerHeight(layers, s.Layer)
+	if !ok {
 		return fail(fmt.Errorf("bql: unknown layer %q", s.Layer))
 	}
 
@@ -373,20 +396,32 @@ func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error)
 		parentID = matches[0].ID
 	}
 
-	rec, err := tx.Create(s.Layer, parentID, s.Attrs)
-	if err != nil {
-		return fail(err)
+	var rows []Row
+	for _, assigns := range s.Rows {
+		attrs, err := applyAssignments(layers[height], nil, assigns)
+		if err != nil {
+			return fail(err)
+		}
+		rec, err := tx.Create(s.Layer, parentID, attrs)
+		if err != nil {
+			return fail(err)
+		}
+		rows = append(rows, recordRow(s.Layer, rec))
 	}
 	snap, err := tx.Commit()
 	if err != nil {
 		return nil, err
 	}
-	return writeResult(ctx, snap, fmt.Sprintf("created %s#%d (id=%d)", s.Layer, rec.Slot, rec.ID),
-		[]Row{recordRow(s.Layer, rec)}), nil
+	msg := fmt.Sprintf("created %d record(s) in %q", len(rows), s.Layer)
+	if len(rows) == 1 {
+		msg = fmt.Sprintf("created %s#%d (id=%d)", s.Layer, rows[0].Slot, rows[0].ID)
+	}
+	return writeResult(ctx, snap, msg, rows), nil
 }
 
-// execUpdate applies the attribute replacement to every selected record
-// in one commit. Zero matches is an error, never a silent no-op.
+// execUpdate sets the listed attributes on every selected record in one
+// commit; unlisted attributes keep their values. Zero matches is an
+// error, never a silent no-op.
 func execUpdate(ctx *ExecContext, branch string, s *UpdateStmt) (*Result, error) {
 	tx, err := ctx.DB.Begin(branch, ctx.Meta)
 	if err != nil {
@@ -400,12 +435,19 @@ func execUpdate(ctx *ExecContext, branch string, s *UpdateStmt) (*Result, error)
 	if err != nil {
 		return fail(err)
 	}
+	matches = applyMutationMods(matches, s.Modifiers)
 	if len(matches) == 0 {
 		return fail(fmt.Errorf("bql: no records in %q matched [%s]", s.Target.Layer, filtersString(s.Target.Filters)))
 	}
+	layers := tx.Layers()
+	height, _ := layerHeight(layers, s.Target.Layer) // matchRef already validated the layer
 	var rows []Row
 	for _, r := range matches {
-		rec, err := tx.Update(s.Target.Layer, r.ID, s.Attrs)
+		attrs, err := applyAssignments(layers[height], r.Attrs, s.Assignments)
+		if err != nil {
+			return fail(err)
+		}
+		rec, err := tx.Update(s.Target.Layer, r.ID, attrs)
 		if err != nil {
 			return fail(err)
 		}
@@ -434,6 +476,7 @@ func execDelete(ctx *ExecContext, branch string, s *DeleteStmt) (*Result, error)
 	if err != nil {
 		return fail(err)
 	}
+	matches = applyMutationMods(matches, s.Modifiers)
 	if len(matches) == 0 {
 		return fail(fmt.Errorf("bql: no records in %q matched [%s]", s.Target.Layer, filtersString(s.Target.Filters)))
 	}
@@ -452,6 +495,51 @@ func execDelete(ctx *ExecContext, branch string, s *DeleteStmt) (*Result, error)
 	return writeResult(ctx, snap,
 		fmt.Sprintf("cascade deleted %d record(s) under %d root(s) in %q",
 			total, len(matches), s.Target.Layer), nil), nil
+}
+
+// maxAssignmentIndex caps positional assignments so a typo'd huge index
+// cannot allocate an enormous attribute slice.
+const maxAssignmentIndex = 1 << 20
+
+// applyAssignments turns an assignment bracket into a full attribute
+// list on top of base (nil for CREATE). Fields resolve by declared name
+// (case-insensitive) or positional index; gaps fill with "", and
+// positions past the end of base extend the record's attributes.
+func applyAssignments(layer engine.Layer, base []string, assigns []Assignment) ([]string, error) {
+	attrs := append([]string(nil), base...)
+	for _, a := range assigns {
+		idx, err := assignIndex(layer, a.Field)
+		if err != nil {
+			return nil, err
+		}
+		if idx < 0 || idx > maxAssignmentIndex {
+			return nil, fmt.Errorf("bql: attribute index %d out of range (0..%d)", idx, maxAssignmentIndex)
+		}
+		for len(attrs) <= idx {
+			attrs = append(attrs, "")
+		}
+		attrs[idx] = a.Value
+	}
+	return attrs, nil
+}
+
+// assignIndex resolves one assignment field to an attribute position:
+// a numeric field is an index, anything else must be a declared
+// attribute name. Builtin record fields (id, slot, parent) are not
+// writable.
+func assignIndex(layer engine.Layer, field string) (int, error) {
+	switch strings.ToLower(field) {
+	case "id", "slot", "parent":
+		return 0, fmt.Errorf("bql: %s is a record field, not an attribute; it cannot be assigned", strings.ToLower(field))
+	}
+	if n, err := strconv.Atoi(field); err == nil {
+		return n, nil
+	}
+	idx, ok := layer.AttrIndex(field)
+	if !ok {
+		return 0, attrUnknownError(layer, field)
+	}
+	return idx, nil
 }
 
 func writeResult(ctx *ExecContext, snap *engine.Snapshot, message string, rows []Row) *Result {

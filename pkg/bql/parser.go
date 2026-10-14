@@ -113,6 +113,29 @@ func (f Filter) String() string {
 	return fmt.Sprintf("%s=(%s=%s)", f.Field, f.Op, f.Value)
 }
 
+// Assignment is one Field=value pair of a mutation's attribute
+// bracket: an attribute to set, by declared name or positional index.
+// id, slot and parent are record fields set by the engine
+// (auto-assigned), never by assignment.
+type Assignment struct {
+	Field string // attribute name or index (as written)
+	Value string
+}
+
+// MutationModifiers are the optional result controls of a mutation's
+// final bracket: limit caps how many matched records are touched (0 =
+// all), sort orders the matched records by id before the cap. Both are
+// optional; with neither the bracket is omitted entirely.
+//
+//	UPDATE Users[region=emea][active=yes][limit=10,sort=asc]
+//	DELETE Accounts[stale=yes][sort=desc][limit=1]
+type MutationModifiers struct {
+	Limit int
+	Sort  string // "" | "asc" | "desc"
+}
+
+func (m MutationModifiers) isZero() bool { return m.Limit == 0 && m.Sort == "" }
+
 // GetModifiers are the result controls of the final bracket: limit caps
 // the row count (0 = unlimited), sort orders rows by record ID.
 type GetModifiers struct {
@@ -121,25 +144,28 @@ type GetModifiers struct {
 }
 
 // CreateStmt creates a record, optionally under an existing parent
-// record. The parent must match exactly one record:
+// record, and sets its attributes from an assignment bracket. The
+// parent must match exactly one record:
 //
-//	CREATE Accounts ("Acme Corp", "2026-01-01")
-//	CREATE Users PARENT Teams[id=101] ("Sam", "sam@dev.io")
+//	CREATE Accounts [name="Acme Corp",date="2026-01-01"]
+//	CREATE Users PARENT Teams[id=101] [name="Sam",email="sam@dev.io"]
 type CreateStmt struct {
 	Layer  string
-	Parent *RecordRef // nil creates a root record
-	Attrs  []string
+	Parent *RecordRef     // nil creates a root record
+	Rows   [][]Assignment // one assignment bracket per new record
 }
 
-// UpdateStmt replaces the scalar attributes of every record matching
-// the filters in one commit. No filters means every record in the
-// layer:
+// UpdateStmt sets the listed attributes on every record matching the
+// filters in one commit; attributes that are not listed keep their
+// current values (the same idea as SQL's UPDATE ... SET). No filters
+// means every record in the layer:
 //
-//	UPDATE Users[id=1001] ("Alex Rivera", "alex@dev.io")
-//	UPDATE Users[age=(lt=18)] ("minor")
+//	UPDATE Users[id=1001][name="Alex Rivera"]
+//	UPDATE Users[age=(lt=18)][region=none]
 type UpdateStmt struct {
-	Target RecordRef
-	Attrs  []string
+	Target      RecordRef
+	Assignments []Assignment
+	Modifiers   MutationModifiers
 }
 
 // DeleteStmt cascade-deletes every record matching the filters (and all
@@ -149,7 +175,8 @@ type UpdateStmt struct {
 //	DELETE Accounts[id=1]
 //	DELETE Accounts[region=emea]
 type DeleteStmt struct {
-	Target RecordRef
+	Target    RecordRef
+	Modifiers MutationModifiers
 }
 
 // ShowStmt lists database objects: LAYERS, BRANCHES, COMMITS or RECORDS.
@@ -246,21 +273,86 @@ func (p *parser) parseStmt() (Statement, error) {
 }
 
 // parseRecordRef parses a layer name with an optional filter bracket
-// (or [*]) selecting its records.
-func (p *parser) parseRecordRef() (RecordRef, error) {
+// (or [*]) selecting its records. Repeated filter brackets AND
+// together, mirroring GET.
+func (p *parser) parseRecordRef() (RecordRef, MutationModifiers, error) {
 	name, err := p.expect(tokIdent, "layer name")
 	if err != nil {
-		return RecordRef{}, err
+		return RecordRef{}, MutationModifiers{}, err
 	}
 	ref := RecordRef{Layer: name.text}
-	if p.peek().kind == tokLBrack {
-		filters, err := p.parseFiltersOnly()
+	var mods MutationModifiers
+	seenMod := false
+	for p.peek().kind == tokLBrack {
+		items, err := p.parseBracketItems()
 		if err != nil {
-			return RecordRef{}, err
+			return RecordRef{}, MutationModifiers{}, err
 		}
-		ref.Filters = filters
+		kind, err := classifyBracket(items)
+		if err != nil {
+			return RecordRef{}, MutationModifiers{}, err
+		}
+		switch kind {
+		case brProject:
+			// [*] on its own means "no filters"; consume it and continue.
+			if len(items) == 1 && items[0].star {
+				continue
+			}
+			return RecordRef{}, MutationModifiers{}, fmt.Errorf("bql: bare selectors are gone; write id=1 or slot=1 in a filter bracket")
+		case brFilters:
+			if seenMod {
+				return RecordRef{}, MutationModifiers{}, fmt.Errorf("bql: filter brackets must precede the limit/sort bracket")
+			}
+			fs, err := filtersFromItems(items)
+			if err != nil {
+				return RecordRef{}, MutationModifiers{}, err
+			}
+			ref.Filters = append(ref.Filters, fs...)
+		case brModifiers:
+			// Several modifier brackets may follow ([sort=..][limit=..]); each
+			// contributes its keys, and a repeated key is the real error.
+			seenMod = true
+			for _, it := range items {
+				if err := applyMutationModifier(&mods, it); err != nil {
+					return RecordRef{}, MutationModifiers{}, err
+				}
+			}
+			// one bracket may hold both limit and sort; the guard is per-bracket
+		}
 	}
-	return ref, nil
+	return ref, mods, nil
+}
+
+func applyMutationModifier(mods *MutationModifiers, it getBracketItem) error {
+	if it.op != OpEq {
+		return fmt.Errorf("bql: %s does not take a comparison operator", it.field)
+	}
+	switch {
+	case strings.EqualFold(it.field, "limit"):
+		if mods.Limit != 0 {
+			return fmt.Errorf("bql: duplicate limit modifier")
+		}
+		n, err := strconv.ParseUint(it.value, 10, 31)
+		if err != nil {
+			return fmt.Errorf("bql: limit must be a non-negative number, got %q", it.value)
+		}
+		mods.Limit = int(n)
+	case strings.EqualFold(it.field, "sort"):
+		if mods.Sort != "" {
+			return fmt.Errorf("bql: duplicate sort modifier")
+		}
+		switch strings.ToLower(it.value) {
+		case "asc":
+			mods.Sort = "asc"
+		case "desc":
+			mods.Sort = "desc"
+		default:
+			return fmt.Errorf("bql: sort must be asc or desc, got %q", it.value)
+		}
+	default:
+		return fmt.Errorf("bql: unknown mutation modifier %q (want limit or sort)", it.field)
+	}
+	return nil
 }
 
 // parseFiltersOnly parses a bracket that may only hold filters ([*] is
@@ -292,32 +384,77 @@ func (p *parser) parseFiltersOnly() ([]Filter, error) {
 	return filters, nil
 }
 
-// parseAttrList parses a parenthesized list of positional attribute
-// strings: ("Acme Corp", "2026-01-01").
-func (p *parser) parseAttrList() ([]string, error) {
-	if _, err := p.expect(tokLParen, "'(' to start the attribute list"); err != nil {
+// parseAssignmentBracket parses a bracket of Field=Value pairs that set
+// a record's attributes, by declared attribute name or positional
+// index — the same fields filters accept, minus the operators:
+//
+//	[name="Sam", email="sam@dev.io"]    declared names
+//	[0="Sam", 1="sam@dev.io"]           positional indexes
+func (p *parser) parseAssignmentBracket() ([]Assignment, error) {
+	items, err := p.parseBracketItems()
+	if err != nil {
 		return nil, err
 	}
-	var attrs []string
-	if p.peek().kind == tokRParen {
-		p.next()
-		return attrs, nil
+	return assignmentsFromItems(items)
+}
+
+// filtersFromItems converts bracket items into filters, enforcing that a
+// filter bracket holds only Field=Value / Field=(op=Value) predicates.
+func filtersFromItems(items []getBracketItem) ([]Filter, error) {
+	var filters []Filter
+	for _, it := range items {
+		switch {
+		case it.star:
+			if len(items) == 1 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("bql: '*' cannot combine with filters")
+		case it.slot:
+			return nil, fmt.Errorf("bql: '#%d' selectors are not part of BQL; use slot=%d in the filter bracket", it.n, it.n)
+		case !it.hasValue:
+			if it.num {
+				return nil, fmt.Errorf("bql: bare selectors are gone; write id=%d (or slot=%d) to target a record", it.n, it.n)
+			}
+			return nil, fmt.Errorf("bql: expected a filter like id=1 or Name=value, got %q", it.name)
+		}
+		filters = append(filters, Filter{Field: it.field, Op: it.op, Value: it.value})
 	}
-	for {
-		s, err := p.expect(tokString, "quoted attribute")
-		if err != nil {
-			return nil, err
-		}
-		attrs = append(attrs, s.text)
-		if p.peek().kind == tokComma {
-			p.next()
-			continue
-		}
-		if _, err := p.expect(tokRParen, "')' to close the attribute list"); err != nil {
-			return nil, err
-		}
-		return attrs, nil
+	return filters, nil
+}
+
+// assignmentsFromItems converts bracket items into attribute assignments.
+func assignmentsFromItems(items []getBracketItem) ([]Assignment, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("bql: empty attribute bracket; omit it entirely to write no attributes")
 	}
+	seen := map[string]bool{}
+	assigns := make([]Assignment, 0, len(items))
+	for _, it := range items {
+		switch {
+		case it.star:
+			return nil, fmt.Errorf("bql: '*' is not an assignment; write attributes like name=\"Sam\"")
+		case it.slot:
+			return nil, fmt.Errorf("bql: '#%d' selectors are not part of BQL; assign by index like [%d=\"value\"]", it.n, it.n)
+		case !it.hasValue:
+			if it.num {
+				return nil, fmt.Errorf("bql: attribute index %d needs a value, e.g. %d=\"Sam\"", it.n, it.n)
+			}
+			return nil, fmt.Errorf("bql: expected an assignment like name=\"Sam\", got %q", it.name)
+		case it.op != OpEq:
+			return nil, fmt.Errorf("bql: assignments do not take a comparison operator; write %s=%s", it.field, strconv.Quote(it.value))
+		}
+		switch strings.ToLower(it.field) {
+		case "id", "slot", "parent":
+			return nil, fmt.Errorf("bql: %s is a record field, not an attribute; it cannot be assigned", strings.ToLower(it.field))
+		}
+		key := strings.ToLower(it.field)
+		if seen[key] {
+			return nil, fmt.Errorf("bql: duplicate assignment for attribute %q", it.field)
+		}
+		seen[key] = true
+		assigns = append(assigns, Assignment{Field: it.field, Value: it.value})
+	}
+	return assigns, nil
 }
 
 // parseGet handles a path traversal of adjacent layers, each step with
@@ -342,7 +479,8 @@ func (p *parser) parseGet() (Statement, error) {
 	return &GetStmt{Path: path}, nil
 }
 
-// bracketKind classifies a GET bracket group by its items.
+// bracketKind classifies a bracket group by its items and, for mutations,
+// by its position in the statement.
 type bracketKind int
 
 const (
@@ -621,8 +759,33 @@ func applyModifier(mods *GetModifiers, it getBracketItem) error {
 
 // parseCreate handles:
 //
-//	CREATE Layer ("attrs", ...)
-//	CREATE Layer PARENT Layer[filters] ("attrs", ...)
+//	CREATE Layer [field=value, ...]
+//	CREATE Layer PARENT Layer[filters] [field=value, ...]
+//
+// parseCreateParentRef parses the PARENT target: a layer name with exactly
+// one filter bracket. Unlike a standalone record ref it must not consume
+// the trailing assignment bracket that follows, so it reads at most one
+// bracket and leaves the rest for parseAssignmentBracket.
+func (p *parser) parseCreateParentRef() (RecordRef, error) {
+	name, err := p.expect(tokIdent, "layer name")
+	if err != nil {
+		return RecordRef{}, err
+	}
+	ref := RecordRef{Layer: name.text}
+	if p.peek().kind == tokLBrack {
+		items, err := p.parseBracketItems()
+		if err != nil {
+			return RecordRef{}, err
+		}
+		fs, err := filtersFromItems(items)
+		if err != nil {
+			return RecordRef{}, err
+		}
+		ref.Filters = fs
+	}
+	return ref, nil
+}
+
 func (p *parser) parseCreate() (Statement, error) {
 	name, err := p.expect(tokIdent, "layer name")
 	if err != nil {
@@ -631,40 +794,113 @@ func (p *parser) parseCreate() (Statement, error) {
 	stmt := &CreateStmt{Layer: name.text}
 	if p.peek().kind == tokIdent && keyword(p.peek(), "PARENT") {
 		p.next()
-		parent, err := p.parseRecordRef()
+		parent, err := p.parseCreateParentRef()
 		if err != nil {
 			return nil, err
 		}
 		stmt.Parent = &parent
 	}
-	attrs, err := p.parseAttrList()
-	if err != nil {
-		return nil, err
+	if p.peek().kind == tokLParen {
+		return nil, fmt.Errorf("bql: attribute lists in parentheses are gone; use a bracket of assignments, e.g. CREATE %s [name=\"value\"]", stmt.Layer)
 	}
-	stmt.Attrs = attrs
+	for p.peek().kind == tokLBrack {
+		assigns, err := p.parseAssignmentBracket()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Rows = append(stmt.Rows, assigns)
+	}
+	if len(stmt.Rows) == 0 {
+		return nil, fmt.Errorf("bql: CREATE needs at least one assignment bracket, e.g. CREATE %s [name=\"value\"]", stmt.Layer)
+	}
 	return stmt, nil
 }
 
-// parseUpdate handles update(Layer[filters], ["attrs"...]).
+// parseUpdate handles UPDATE Layer[filters]...[modifiers][assignments]:
+// filter brackets pick the records (AND together), an optional [limit=N,sort=asc|desc]
+// bracket caps/orders which matched records are touched, and the final bracket
+// sets attributes. The assignment bracket is always last.
 func (p *parser) parseUpdate() (Statement, error) {
-	ref, err := p.parseRecordRef()
+	name, err := p.expect(tokIdent, "layer name")
 	if err != nil {
 		return nil, err
 	}
-	attrs, err := p.parseAttrList()
-	if err != nil {
-		return nil, err
+	ref := RecordRef{Layer: name.text}
+	var mods MutationModifiers
+	var assigns []Assignment
+	sawFilter := false
+	for p.peek().kind == tokLBrack {
+		// Classify each bracket by position: modifiers ([limit=,sort=]) may
+		// appear anywhere; a plain Field=Value bracket is a filter unless it
+		// is the last bracket, in which case it is the attribute bracket.
+		items, err := p.parseBracketItems()
+		if err != nil {
+			return nil, err
+		}
+		kind, err := classifyBracket(items)
+		if err != nil {
+			return nil, err
+		}
+		if kind == brProject {
+			// [*] on its own means "no filters"; consume it and continue.
+			if len(items) == 1 && items[0].star {
+				continue
+			}
+			return nil, fmt.Errorf("bql: bare selectors are gone; write id=1 or slot=1 in a filter bracket")
+		}
+		if kind == brModifiers {
+			// Several modifier brackets may follow ([sort=..][limit=..]); each
+			// contributes its keys, and a repeated key is the real error.
+			for _, it := range items {
+				if err := applyMutationModifier(&mods, it); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		// Plain Field=Value bracket. If another bracket follows, this is a
+		// filter bracket; at end of statement it is the trailing attribute
+		// bracket.
+		if p.peek().kind == tokLBrack {
+			fs, err := filtersFromItems(items)
+			if err != nil {
+				return nil, err
+			}
+			ref.Filters = append(ref.Filters, fs...)
+			sawFilter = true
+			continue
+		}
+		// Nothing but the assignment bracket remains: this is it.
+		if !sawFilter {
+			return nil, fmt.Errorf("bql: UPDATE needs at least one filter bracket before the attribute bracket, e.g. UPDATE %s[id=1][name=\"value\"]", ref.Layer)
+		}
+		for _, it := range items {
+			if it.op != OpEq {
+				return nil, fmt.Errorf("bql: assignments do not take a comparison operator; write %s=%s", it.field, strconv.Quote(it.value))
+			}
+		}
+		a, err := assignmentsFromItems(items)
+		if err != nil {
+			return nil, err
+		}
+		assigns = a
+		break
 	}
-	return &UpdateStmt{Target: ref, Attrs: attrs}, nil
+	if assigns == nil {
+		return nil, fmt.Errorf("bql: UPDATE needs an attribute bracket, e.g. UPDATE %s[id=1][name=\"value\"]", ref.Layer)
+	}
+	return &UpdateStmt{Target: ref, Assignments: assigns, Modifiers: mods}, nil
 }
 
-// parseDelete handles delete(Layer[filters]).
+// parseDelete handles DELETE Layer[filters]...[limit=N,sort=asc|desc]:
+// filter brackets pick the roots (AND together) and an optional trailing
+// modifier bracket caps/orders which matched roots are cascade-deleted.
 func (p *parser) parseDelete() (Statement, error) {
-	ref, err := p.parseRecordRef()
+	ref, mods, err := p.parseRecordRef()
 	if err != nil {
 		return nil, err
 	}
-	return &DeleteStmt{Target: ref}, nil
+	return &DeleteStmt{Target: ref, Modifiers: mods}, nil
 }
 
 func (p *parser) parseShow() (Statement, error) {
