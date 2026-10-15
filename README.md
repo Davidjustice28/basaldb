@@ -1,40 +1,72 @@
 # BasalDB
 
-**One file. One database. Built for data that lives in hierarchies.**
+**Git-style memory for AI agents. One file.**
 
-BasalDB is a small embedded database for data that nests: accounts contain
-teams, teams contain people, canvases contain frames, frames contain shapes.
-The whole database is a single portable file (`.bsl`). There's no server to
-install, and every write is recorded in an append-only commit log you can
-read with `cat`.
-
-```
-Account "Acme Corp"
-├── Team "Engineering"
-│   ├── User "Sam"
-│   └── User "Elena"
-└── Team "Sales"
-    └── User "Ravi"
-```
+BasalDB is a small embedded database for data that lives in trees:
+the runs, facts and skills an agent accumulates. Every write records
+who made it and why, you can branch the data to try something and throw
+it away, and one `DELETE` forgets a whole subtree. The database is a
+single `.bsl` file with no server to install.
 
 ```console
-$ basal query 'GET Accounts[name="Acme Corp"] -> Teams[name="Engineering"] -> Users[name,email]'
-layer | id | slot | parent | children | attrs
-Users[6#0] parent=3 children=[] "Sam" "sam@acme.io"
-Users[7#1] parent=3 children=[] "Elena" "elena@acme.io"
-2 record(s) on branch "main"
+$ basal init -file mem.bsl -layers "0:Users(name),1:Topics(name),2:Facts(text,source,confidence)"
+$ basal config set file mem.bsl
+$ basal query 'CREATE Users [name="u_42"]'
+$ basal query 'CREATE Topics PARENT Users[name="u_42"] [name="travel"]'
+
+# an agent stores a fact, with where it came from and why
+$ basal query -author memory-agent -summary "learned preference" -reason "user said so in session 12" \
+    'CREATE Facts PARENT Topics[name="travel"] [text="Prefers aisle seats",source="session:12",confidence="0.9"]'
+
+# recall by walking the tree: no joins
+$ basal query 'GET Users[name="u_42"] -> Topics[name="travel"] -> Facts[text,confidence]'
+Facts[3#0] parent=2 children=[] "Prefers aisle seats" "0.9"
+
+# why does the agent believe that?
+$ basal query 'SHOW COMMITS'
+id | branch | author | summary | reason | timestamp
+4 | main | memory-agent | learned preference | user said so in session 12 | 1792092841
+
+# forget the user completely, in one step
+$ basal query 'DELETE Users[name="u_42"]'
+cascade deleted 3 record(s) under 1 root(s) in "Users"
 ```
 
-> **Status: early / experimental.** The core works (create, query, update,
-> cascade delete, branches, audit log), but the format and the query
-> language may still change. Don't use it for data you can't afford to
-> lose. In particular, **don't let several processes write to the same
-> file at once** ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+### One file for everything an agent knows
+
+| Kind of memory | Example | What BasalDB gives you | Status |
+|---|---|---|---|
+| **Episodic**: what happened | session → task → step traces, crawl runs | trees and `->` paths; who/why on every write; branches for retries | ✅ today |
+| **Semantic**: what it knows | user → topic → fact, page → findings | path recall, one-step forget, provenance per fact | ✅ today |
+| | ask a question, get the relevant facts for *this* user only | RAG search scoped to a subtree, `[near="…",k=5]` | 🛣️ planned ([#49](https://github.com/Davidjustice28/basildb/issues/49)) |
+| | raw page HTML, screenshots, long transcripts | blob attributes stored out-of-line | 🛣️ planned ([#50](https://github.com/Davidjustice28/basildb/issues/50)) |
+| **Procedural**: how to do things | namespace → skill → files | versioned via the commit log; whole skill loads in ~6 µs | ✅ today |
+
+See [AI agents: traces, flows and memory](#ai-agents-traces-flows-and-memory)
+for full walkthroughs. BasalDB also works for any other data that nests
+(SaaS tenants, design canvases, game state); see [Where BasalDB fits](#where-basaldb-fits).
+
+> **Status: early / experimental.** Create, query, update, cascade delete,
+> branches and the audit log work, but the file format and query language
+> may still change. Don't use it for data you can't afford to lose. Known
+> risks, fix first:
+> - **An attribute value over 64 KB, or more than 65,535 children under one
+>   record, commits without error but makes the file unopenable**
+>   ([#44](https://github.com/Davidjustice28/basildb/issues/44)). Keep values
+>   small until this is fixed.
+> - **Don't let several processes write to the same file at once**: writes
+>   can be lost silently ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+>   Use one writer, or route writes through `basald`.
+> - The whole database is held in RAM, at about 2–3× the data size
+>   ([#37](https://github.com/Davidjustice28/basildb/issues/37)).
 >
-> **Performance:** comfortable up to about 50k records per file today.
-> Beyond that, most operations slow down as the file grows. See
-> [BENCHMARKS.md](BENCHMARKS.md) and the
-> [scalability roadmap (#42)](https://github.com/Davidjustice28/basildb/issues/42).
+> **Performance:** path recall, id lookups and subtree deletes run in
+> microseconds to about a millisecond at 250k–500k records in-process.
+> Lookups by attribute value are full scans until
+> [#45](https://github.com/Davidjustice28/basildb/issues/45) lands. See
+> [BENCHMARKS.md](BENCHMARKS.md), the issues labeled
+> [`priority: high`](https://github.com/Davidjustice28/basildb/labels/priority%3A%20high),
+> and the [scalability roadmap (#42)](https://github.com/Davidjustice28/basildb/issues/42).
 
 ---
 
@@ -432,9 +464,16 @@ cascade deleted 4 record(s) under 1 root(s) in "Users"
 **Patterns that work well**
 - **One file per user or agent.** Memory is portable and isolated, and
   deleting it for privacy means deleting a file.
-- **Pair with a vector index for recall.** BasalDB has no similarity
-  search. Store embeddings in a vector store keyed by the BasalDB record
-  `id`; BasalDB holds the structure and provenance.
+- **Pair with a vector index for recall (for now).** BasalDB has no
+  similarity search yet. Store embeddings in a vector store keyed by the
+  BasalDB record `id`; BasalDB holds the structure and provenance. Native
+  RAG search scoped to a subtree is planned in
+  [#49](https://github.com/Davidjustice28/basildb/issues/49).
+- **Keep large bodies out of records.** Store page HTML or long
+  transcripts in files and keep the path, hash and analysis in BasalDB.
+  Values over 64 KB currently corrupt the file
+  ([#44](https://github.com/Davidjustice28/basildb/issues/44)); blob
+  attributes are planned in [#50](https://github.com/Davidjustice28/basildb/issues/50).
 - **Use branches for speculative memory.** Let an agent write
   "hypotheses" on a branch and keep only what's confirmed.
 
