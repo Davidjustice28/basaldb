@@ -1,6 +1,7 @@
 package bql
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -75,6 +76,8 @@ func TestParseMutationsAndBranches(t *testing.T) {
 			&DeleteStmt{Target: RecordRef{Layer: "Accounts", Filters: []Filter{{Field: "stale", Op: OpEq, Value: "yes"}}}, Modifiers: MutationModifiers{Limit: 1, Sort: "desc"}}},
 		{`SHOW LAYERS`, &ShowStmt{Kind: "LAYERS"}},
 		{`show records Users`, &ShowStmt{Kind: "RECORDS", Layer: "Users"}},
+		{`SHOW SCHEMA`, &ShowStmt{Kind: "SCHEMA"}},
+		{`show schema Users`, &ShowStmt{Kind: "SCHEMA", Layer: "Users"}},
 		{`BRANCH LIST`, &BranchStmt{Action: "LIST"}},
 		{`BRANCH USE dev`, &BranchStmt{Action: "USE", Name: "dev"}},
 		{`BRANCH CREATE feature FROM main`, &BranchStmt{Action: "CREATE", Name: "feature", From: "main"}},
@@ -290,7 +293,7 @@ func TestExecCreateMultiRowAutoIDs(t *testing.T) {
 
 	// Three rows, one bracket each, all in one commit; ids auto-assign in
 	// row order and never collide with the pre-seeded records.
-	res := mustExec(t, ctx, `CREATE Users [0="Sam",1="sam@dev.io"] [0="Ada",1="ada@dev.io"] [0="Linus",1="linus@dev.io"]`)
+	res := mustExec(t, ctx, `CREATE Users PARENT Teams[id=3] [0="Sam",1="sam@dev.io"] [0="Ada",1="ada@dev.io"] [0="Linus",1="linus@dev.io"]`)
 	if len(res.Rows) != 3 {
 		t.Fatalf("multi-row CREATE returned %d rows, want 3 (%+v)", len(res.Rows), res.Rows)
 	}
@@ -739,5 +742,119 @@ func TestIndexedPointLookups(t *testing.T) {
 	}
 	if res = mustExec(t, ctx, `GET Users`); len(res.Rows) != 2 {
 		t.Errorf("users after point delete = %d, want 2", len(res.Rows))
+	}
+}
+
+// A record outside the root layer always needs PARENT, so no cascade
+// delete can miss an orphan (issue #5).
+func TestExecCreateRequiresParentOnNonRootLayers(t *testing.T) {
+	_, ctx := setupDB(t)
+
+	if _, err := Exec(ctx, `CREATE Users [0="orphan"]`); err == nil || !strings.Contains(err.Error(), "PARENT") {
+		t.Errorf("parentless child CREATE = %v, want PARENT error", err)
+	}
+	if _, err := Exec(ctx, `CREATE Teams [0="orphan team"]`); err == nil {
+		t.Error("parentless Teams CREATE succeeded")
+	}
+	// The rejected statement rolled back: no record was written.
+	if res := mustExec(t, ctx, `SHOW RECORDS Users`); len(res.Rows) != 3 {
+		t.Errorf("users after rejected CREATE = %d, want 3", len(res.Rows))
+	}
+
+	// Root layers still create without PARENT...
+	mustExec(t, ctx, `CREATE Accounts [0="Rootless Inc"]`)
+	// ...and child layers with it.
+	mustExec(t, ctx, `CREATE Teams PARENT Accounts[0="Rootless Inc"] [0="Ops"]`)
+	res := mustExec(t, ctx, `GET Accounts[0="Rootless Inc"] -> Teams`)
+	if len(res.Rows) != 1 || res.Rows[0].Attrs[0] != "Ops" {
+		t.Errorf("child create under new parent = %+v", res.Rows)
+	}
+}
+
+// SHOW SCHEMA reports the declared attribute names per layer (issue #18).
+func TestShowSchema(t *testing.T) {
+	db, err := engine.Init(t.TempDir()+"/schema.bsl", []engine.Layer{
+		{Height: 0, Name: "Accounts", Attrs: []string{"name", "plan"}},
+		{Height: 1, Name: "Teams", Attrs: []string{"name"}},
+		{Height: 2, Name: "Users"},
+	}, engine.TxMeta{Author: "Test", Summary: "init", Reason: "tests"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := &ExecContext{DB: db, Branch: engine.DefaultBranch}
+
+	res := mustExec(t, ctx, `SHOW SCHEMA`)
+	if len(res.Columns) != 3 || res.Columns[2] != "attributes" {
+		t.Fatalf("schema columns = %v", res.Columns)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("schema rows = %d, want 3", len(res.Rows))
+	}
+	if got := strings.Join(res.Rows[0].Cells, " | "); got != "0 | Accounts | name, plan" {
+		t.Errorf("accounts schema = %q", got)
+	}
+	if got := strings.Join(res.Rows[2].Cells, " | "); got != "2 | Users | " {
+		t.Errorf("undeclared schema = %q, want empty attribute list", got)
+	}
+
+	res = mustExec(t, ctx, `SHOW SCHEMA Users`)
+	if len(res.Rows) != 1 || res.Rows[0].Cells[1] != "Users" {
+		t.Errorf("filtered schema = %+v", res.Rows)
+	}
+	if _, err := Exec(ctx, `SHOW SCHEMA Nope`); err == nil {
+		t.Error("SHOW SCHEMA for an unknown layer succeeded")
+	}
+}
+
+// Record rows always carry every built-in field in JSON, zero values and
+// empty lists included (issue #7).
+func TestRowJSONAlwaysIncludesBuiltins(t *testing.T) {
+	_, ctx := setupDB(t)
+
+	res := mustExec(t, ctx, `GET Accounts[id=1]`)
+	b, err := json.Marshal(res.Rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(b, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("marshalled rows = %d, want 1", len(rows))
+	}
+	for _, field := range []string{"layer", "id", "slot", "parent", "children", "attrs"} {
+		if _, ok := rows[0][field]; !ok {
+			t.Errorf("record row JSON is missing %q: %s", field, b)
+		}
+	}
+	// Account 1 sits at slot 0 and is a root: both zeros must be explicit.
+	if rows[0]["slot"] != float64(0) || rows[0]["parent"] != float64(0) {
+		t.Errorf("builtin zero values must be present: %v", rows[0])
+	}
+	if kids, ok := rows[0]["children"].([]any); !ok || len(kids) != 2 {
+		t.Errorf("children = %v, want [3,4]", rows[0]["children"])
+	}
+
+	// A childless record renders children as [], not null.
+	res = mustExec(t, ctx, `GET Users[id=6]`)
+	b, _ = json.Marshal(res.Rows)
+	if !strings.Contains(string(b), `"children":[]`) {
+		t.Errorf("childless row JSON = %s, want empty array", b)
+	}
+
+	// Catalog rows keep their cell-list shape.
+	res = mustExec(t, ctx, `SHOW LAYERS`)
+	b, _ = json.Marshal(res.Rows)
+	var cells []map[string]any
+	if err := json.Unmarshal(b, &cells); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cells[0]["cells"]; !ok {
+		t.Errorf("catalog row JSON = %s, want cells", b)
+	}
+	if _, ok := cells[0]["id"]; ok {
+		t.Errorf("catalog row JSON carries record fields: %s", b)
 	}
 }

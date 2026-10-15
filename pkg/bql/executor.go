@@ -1,6 +1,7 @@
 package bql
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -29,6 +30,39 @@ type Row struct {
 	Cells    []string `json:"cells,omitempty"`
 }
 
+// MarshalJSON renders record rows with every built-in field present, zero
+// values included and empty lists as [] instead of null, so a consumer can
+// tell "slot 0" from "field missing" and "no children" from "unset"
+// (#7). Catalog rows (SHOW / BRANCH) keep their omitempty shape: they are
+// cell lists, not records.
+func (r Row) MarshalJSON() ([]byte, error) {
+	type cellsRow struct {
+		Cells []string `json:"cells"`
+	}
+	type recordRowJSON struct {
+		Layer    string   `json:"layer"`
+		ID       uint64   `json:"id"`
+		Slot     uint64   `json:"slot"`
+		Parent   uint64   `json:"parent"`
+		Children []uint64 `json:"children"`
+		Attrs    []string `json:"attrs"`
+	}
+	if len(r.Cells) > 0 {
+		return json.Marshal(cellsRow{Cells: r.Cells})
+	}
+	children, attrs := r.Children, r.Attrs
+	if children == nil {
+		children = []uint64{}
+	}
+	if attrs == nil {
+		attrs = []string{}
+	}
+	return json.Marshal(recordRowJSON{
+		Layer: r.Layer, ID: r.ID, Slot: r.Slot, Parent: r.Parent,
+		Children: children, Attrs: attrs,
+	})
+}
+
 // CommitInfo is the commit block echoed back after a write statement.
 type CommitInfo struct {
 	ID        uint64 `json:"id"`
@@ -42,7 +76,12 @@ type CommitInfo struct {
 
 // Result is the outcome of one statement.
 type Result struct {
-	Columns   []string    `json:"columns"`
+	Columns []string `json:"columns"`
+	// Fields names the attribute values carried in each record row's
+	// Attrs, in order (projected names for a column selection, else the
+	// layer's declared names). Empty when the layer declares none or the
+	// rows are catalog cells. Delimited output (#28) uses it for headers.
+	Fields    []string    `json:"fields,omitempty"`
 	Rows      []Row       `json:"rows,omitempty"`
 	Message   string      `json:"message,omitempty"`
 	Commit    *CommitInfo `json:"commit,omitempty"`
@@ -105,6 +144,19 @@ func layerHeight(layers []engine.Layer, name string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// layerByName looks a layer up by name. Layers() returns the declared
+// layers in ascending height order but compacted, so height is only safe
+// as an index when heights happen to be contiguous (0,1,2,...); matching by
+// name always is.
+func layerByName(layers []engine.Layer, name string) (engine.Layer, bool) {
+	for _, l := range layers {
+		if l.Name == name {
+			return l, true
+		}
+	}
+	return engine.Layer{}, false
 }
 
 // indexedEq returns the first equality filter on a builtin record field
@@ -290,6 +342,12 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 		}
 		rows = append(rows, row)
 	}
+	var fields []string
+	if len(final.Project) > 0 {
+		fields = projectFields(finalLayer, final.Project)
+	} else {
+		fields = attrFields(finalLayer.Attrs, rows)
+	}
 	if final.Modifiers.Sort != "" {
 		asc := final.Modifiers.Sort == "asc"
 		sort.SliceStable(rows, func(i, j int) bool {
@@ -304,6 +362,7 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	}
 	return &Result{
 		Columns: recordColumns,
+		Fields:  fields,
 		Rows:    rows,
 		Message: fmt.Sprintf("%d record(s) on branch %q", len(rows), branch),
 	}, nil
@@ -426,6 +485,50 @@ func compareAttrFilter(actual string, f Filter) (bool, error) {
 	}
 }
 
+// projectFields names the projected columns for Result.Fields: a
+// by-name reference keeps the name as written, a positional one resolves
+// to the declared attribute name when the layer has one.
+func projectFields(layer engine.Layer, proj []AttrRef) []string {
+	out := make([]string, 0, len(proj))
+	for _, a := range proj {
+		if a.ByName {
+			out = append(out, a.Name)
+			continue
+		}
+		if a.Index >= 0 && a.Index < len(layer.Attrs) {
+			out = append(out, layer.Attrs[a.Index])
+			continue
+		}
+		out = append(out, strconv.Itoa(a.Index))
+	}
+	return out
+}
+
+// attrFields names a result's Attrs values: the layer's declared names
+// where there are any, positional indices (BQL's own 0=, [0,1] syntax)
+// past the declaration or for layers that declare none, sized to the
+// widest row. Returns nil when there is nothing to name.
+func attrFields(declared []string, rows []Row) []string {
+	n := len(declared)
+	for _, r := range rows {
+		if len(r.Attrs) > n {
+			n = len(r.Attrs)
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	out := make([]string, n)
+	for i := range out {
+		if i < len(declared) {
+			out[i] = declared[i]
+		} else {
+			out[i] = strconv.Itoa(i)
+		}
+	}
+	return out
+}
+
 // projectAttrs resolves a projection against the layer's declared
 // attribute names and returns only the referenced columns, in the order
 // written. An index past the record's attributes yields "".
@@ -450,9 +553,10 @@ func projectAttrs(layer engine.Layer, r *engine.Record, proj []AttrRef) ([]strin
 }
 
 // execCreate creates one or more records (one assignment bracket per
-// row), optionally under an existing parent, all in one commit. Without
-// PARENT each record roots its own subtree. Ids are auto-assigned in
-// row order and never collide.
+// row), optionally under an existing parent, all in one commit. Only the
+// root layer may be written without PARENT; a child-layer record always
+// hangs off an existing parent so no cascade delete can miss it (#5).
+// Ids are auto-assigned in row order and never collide.
 func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error) {
 	tx, err := ctx.DB.Begin(branch, ctx.Meta)
 	if err != nil {
@@ -463,9 +567,15 @@ func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error)
 		return nil, err
 	}
 	layers := tx.Layers()
-	height, ok := layerHeight(layers, s.Layer)
-	if !ok {
+	if _, ok := layerHeight(layers, s.Layer); !ok {
 		return fail(fmt.Errorf("bql: unknown layer %q", s.Layer))
+	}
+	layer, _ := layerByName(layers, s.Layer)
+	if s.Parent == nil && layer.Height != layers[0].Height {
+		// A record outside the root layer always hangs off a parent, so a
+		// parentless one could never be reached by a cascade delete (#5).
+		return fail(fmt.Errorf("bql: layer %q is not the root layer; CREATE %s needs PARENT <Layer>[filter] (root layer is %q)",
+			s.Layer, s.Layer, layers[0].Name))
 	}
 
 	parentID := uint64(0)
@@ -482,7 +592,7 @@ func execCreate(ctx *ExecContext, branch string, s *CreateStmt) (*Result, error)
 
 	var rows []Row
 	for _, assigns := range s.Rows {
-		attrs, err := applyAssignments(layers[height], nil, assigns)
+		attrs, err := applyAssignments(layer, nil, assigns)
 		if err != nil {
 			return fail(err)
 		}
@@ -524,10 +634,10 @@ func execUpdate(ctx *ExecContext, branch string, s *UpdateStmt) (*Result, error)
 		return fail(fmt.Errorf("bql: no records in %q matched [%s]", s.Target.Layer, filtersString(s.Target.Filters)))
 	}
 	layers := tx.Layers()
-	height, _ := layerHeight(layers, s.Target.Layer) // matchRef already validated the layer
+	layer, _ := layerByName(layers, s.Target.Layer) // matchRef already validated the layer
 	var rows []Row
 	for _, r := range matches {
-		attrs, err := applyAssignments(layers[height], r.Attrs, s.Assignments)
+		attrs, err := applyAssignments(layer, r.Attrs, s.Assignments)
 		if err != nil {
 			return fail(err)
 		}
@@ -628,6 +738,11 @@ func assignIndex(layer engine.Layer, field string) (int, error) {
 
 func writeResult(ctx *ExecContext, snap *engine.Snapshot, message string, rows []Row) *Result {
 	res := &Result{Columns: recordColumns, Rows: rows, Message: message}
+	if len(rows) > 0 {
+		if l, ok := layerByName(snap.Layers(), rows[0].Layer); ok {
+			res.Fields = attrFields(l.Attrs, rows)
+		}
+	}
 	if c, ok := ctx.DB.Commit(snap.Commit); ok {
 		res.Commit = &CommitInfo{
 			ID:        c.ID,
@@ -662,6 +777,8 @@ func execShow(ctx *ExecContext, branch string, s *ShowStmt) (*Result, error) {
 			return nil, err
 		}
 		res := &Result{Columns: recordColumns}
+		var single engine.Layer
+		seen := 0
 		for _, l := range snap.Layers() {
 			if s.Layer != "" && l.Name != s.Layer {
 				continue
@@ -669,8 +786,35 @@ func execShow(ctx *ExecContext, branch string, s *ShowStmt) (*Result, error) {
 			for _, r := range snap.Records(l.Height) {
 				res.Rows = append(res.Rows, recordRow(l.Name, r))
 			}
+			single, seen = l, seen+1
+		}
+		if s.Layer != "" && seen == 0 {
+			return nil, fmt.Errorf("bql: unknown layer %q", s.Layer)
+		}
+		// Attribute columns only work when every row comes from one layer;
+		// a multi-layer listing keeps them in a single attrs column.
+		if seen == 1 {
+			res.Fields = attrFields(single.Attrs, res.Rows)
 		}
 		res.Message = fmt.Sprintf("%d record(s) on branch %q", len(res.Rows), branch)
+		return res, nil
+	case "SCHEMA":
+		snap, err := ctx.DB.Snapshot(branch)
+		if err != nil {
+			return nil, err
+		}
+		res := &Result{Columns: []string{"height", "layer", "attributes"}}
+		for _, l := range snap.Layers() {
+			if s.Layer != "" && l.Name != s.Layer {
+				continue
+			}
+			res.Rows = append(res.Rows, Row{Cells: []string{
+				fmt.Sprintf("%d", l.Height), l.Name, strings.Join(l.Attrs, ", "),
+			}})
+		}
+		if s.Layer != "" && len(res.Rows) == 0 {
+			return nil, fmt.Errorf("bql: unknown layer %q", s.Layer)
+		}
 		return res, nil
 	case "BRANCHES":
 		res := &Result{Columns: []string{"name", "fork", "head"}}

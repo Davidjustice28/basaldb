@@ -68,10 +68,10 @@ Full command and query-language reference: **[CLI.md](CLI.md)**.
 | Limit and sort by id | last bracket | `GET Users[*][limit=10,sort=desc]` |
 | Update attributes | `UPDATE Layer[filter][...]` | `UPDATE Users[email="sam@acme.io"][role="owner"]` |
 | Delete a whole subtree | `DELETE Layer[filter]` | `DELETE Accounts[name="Globex"]` (teams and users go too) |
-| See the catalog | `SHOW LAYERS / RECORDS / BRANCHES / COMMITS` | `SHOW RECORDS Users` |
+| See the catalog | `SHOW LAYERS / SCHEMA / RECORDS / BRANCHES / COMMITS` | `SHOW SCHEMA Users` |
 | Branch the data | `basal branch create` + `-branch` | `basal query -branch scratch 'DELETE ...'` |
 | Record who changed what and why | `-author -summary -reason` | stored in the file's commit log |
-| Machine-readable output | `-json` | `basal query -json 'GET Users'` |
+| Machine-readable output | `-json` or `-format csv\|tsv\|json` | `basal query -format csv 'GET Users[name,email]'` |
 | Defaults so you don't repeat `-file` | `basal config set` | `basal config set file acme.bsl` |
 | HTTP access | `basald` | `GET /v1/query?q=...`, `POST /v1/execute` |
 
@@ -93,12 +93,12 @@ tracking issue.
 | Change layers/attributes after `init` | schema is fixed at init ([#17](https://github.com/Davidjustice28/basildb/issues/17), [#29](https://github.com/Davidjustice28/basildb/issues/29), [#30](https://github.com/Davidjustice28/basildb/issues/30)) |
 | Delete, diff or merge branches | create and read only ([#19](https://github.com/Davidjustice28/basildb/issues/19), [#20](https://github.com/Davidjustice28/basildb/issues/20)) |
 | Query the past / undo a commit | no ([#21](https://github.com/Davidjustice28/basildb/issues/21)) |
-| Export / import JSON or CSV | no ([#24](https://github.com/Davidjustice28/basildb/issues/24), [#28](https://github.com/Davidjustice28/basildb/issues/28)) |
+| Export / import a whole database as JSON or CSV | CSV/TSV query output works ([#28](https://github.com/Davidjustice28/basildb/issues/28)); no file export/import yet ([#24](https://github.com/Davidjustice28/basildb/issues/24)) |
 | Verify or compact the file | no ([#25](https://github.com/Davidjustice28/basildb/issues/25), [#26](https://github.com/Davidjustice28/basildb/issues/26)) |
 
-Also note: a child-layer record can currently be created without a
-`PARENT` ([#5](https://github.com/Davidjustice28/basildb/issues/5)). Always
-pass `PARENT` for non-root layers.
+Child layers always need `PARENT`: a `CREATE` outside the root layer
+without one is an error, so no record can end up unreachable by a
+cascade delete.
 
 ---
 
@@ -112,6 +112,8 @@ $ cd basildb
 $ go install ./cmd/basal ./cmd/basald     # installs into $(go env GOPATH)/bin
 # or build a local binary:
 $ go build -o basal ./cmd/basal
+# stamp the version banner (basal version) with release info:
+$ go build -ldflags "-X main.version=v1.0.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%FT%TZ)" -o basal ./cmd/basal
 ```
 
 Check it's on your `PATH`:
@@ -170,7 +172,7 @@ Each write prints the new record and its commit:
 layer | id | slot | parent | children | attrs
 Users[8#2] parent=4 children=[] "Ravi" "ravi@acme.io" "rep" "41"
 created Users#2 (id=8)
-commit 9 on main |  |  |
+commit 9 on main
 ```
 
 `Users[8#2]` means *layer Users, id 8, slot 2*. Ids are unique across

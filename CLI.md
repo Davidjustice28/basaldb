@@ -6,7 +6,7 @@ with the [README's getting-started guide](README.md#getting-started-5-minutes).
 
 - [Cheat sheet](#cheat-sheet)
 - [Concepts](#concepts)
-- [Commands](#commands): [config](#config) · [init](#init) · [query](#query) · [inspect](#inspect) · [branch](#branch)
+- [Commands](#commands): [config](#config) · [init](#init) · [query](#query) · [inspect](#inspect) · [branch](#branch) · [version and help](#version-and-help)
 - [BQL language](#bql-language): [GET](#get) · [CREATE](#create) · [UPDATE](#update) · [DELETE](#delete) · [SHOW](#show) · [BRANCH](#branch-statements)
 - [Recipes](#recipes)
 - [Output formats](#output-formats)
@@ -36,7 +36,9 @@ basal query 'GET Accounts[name="Acme"] -> Teams -> Users'  # walk down
 basal query 'GET Users[name,email][role=admin]'            # columns + filter
 basal query 'GET Users[*][id=(gt=10)][limit=5,sort=desc]'  # compare, limit, sort
 basal query 'SHOW RECORDS Users'
+basal query 'SHOW SCHEMA'
 basal query -json 'GET Users'
+basal query -format csv 'GET Users[name,email]'
 
 # audit
 basal query -author "Alex <a@x.io>" -summary "why in 5 words" -reason "ticket #12" 'UPDATE ...'
@@ -122,7 +124,7 @@ Creates a new container. It refuses to overwrite an existing file.
 $ basal init -file acme.bsl -layers "0:Accounts(name,plan),1:Teams(name),2:Users(name,email,role,age)"
 initialized acme.bsl
 layers: 0:Accounts(name,plan),1:Teams(name),2:Users(name,email,role,age)
-initial commit: 1 (basal <basal@localhost> / Database initialized / manual initialization)
+initial commit: 1 (basal <basal@localhost> | Database initialized | manual initialization)
 ```
 
 | Flag | Default | Meaning |
@@ -155,14 +157,15 @@ characters.
 Runs **one** BQL statement.
 
 ```console
-basal query [-file F] [-branch B] [-json] [-author A -summary S -reason R] 'STATEMENT'
+basal query [-file F] [-branch B] [-format table|csv|tsv|json] [-author A -summary S -reason R] 'STATEMENT'
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-file` | config / `./basal.bsl` | container |
 | `-branch` | config / `main` | branch to read or write |
-| `-json` | off | JSON output |
+| `-format` | `table` | output format: `table`, `csv`, `tsv` or `json` |
+| `-json` | off | alias for `-format json` |
 | `-author` | *(empty)* | stored on the commit (writes) |
 | `-summary` | *(empty)* | stored on the commit (writes) |
 | `-reason` | *(empty)* | stored on the commit (writes) |
@@ -186,9 +189,9 @@ format:  MatrixSlottedPage
 regions: commit log [4096,5882), data [5882,7747), journal [7747,...)
 branch:  main @ commit 11
 layers:
-  0:Accounts     2 record(s)
-  1:Teams        3 record(s)
-  2:Users        4 record(s)
+  0:Accounts     2 record(s)  attrs: name, plan
+  1:Teams        3 record(s)  attrs: name
+  2:Users        4 record(s)  attrs: name, email, role, age
 branches:
   cleanup (fork main@11, head 12)
   main (fork main@0, head 11)
@@ -202,7 +205,7 @@ commits:
 |---|---|
 | `-branch` | branch whose head to show |
 | `-header` | print the raw ASCII header instead (useful when debugging a damaged file) |
-| `-json` | JSON output |
+| `-json` | JSON output; the `layers` entries carry `height`, `name`, `records` and `attributes` |
 
 ```console
 $ basal inspect -header
@@ -256,6 +259,27 @@ the default with `basal config set branch NAME`. Delete, rename, diff
 and merge aren't available yet
 ([#19](https://github.com/Davidjustice28/basildb/issues/19),
 [#20](https://github.com/Davidjustice28/basildb/issues/20)).
+
+### version and help
+
+```console
+$ basal version
+basal v1.0.0 (commit 9807408, built 2026-10-14T20:31:02Z)
+bsl format: 1.0 (MatrixSlottedPage)
+
+$ basal --version        # same output
+$ basal -help            # usage; 'basal help' and '--help' work too
+```
+
+The build stamp is empty in a plain `go build` (`basal dev (commit none,
+built unknown)`); install or CI builds pass it with `-ldflags`:
+
+```sh
+go build -ldflags "-X main.version=v1.0.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%FT%TZ)" -o basal ./cmd/basal
+```
+
+The `bsl format` line is the file format version the binary reads and
+writes — quote it in bug reports.
 
 ---
 
@@ -351,7 +375,7 @@ $ basal query 'CREATE Accounts [name="Acme Corp",plan="pro"]'
 layer | id | slot | parent | children | attrs
 Accounts[1#0] parent=0 children=[] "Acme Corp" "pro"
 created Accounts#0 (id=1)
-commit 2 on main |  |  |
+commit 2 on main
 
 $ basal query 'CREATE Teams PARENT Accounts[name="Acme Corp"] [name="Engineering"]'
 $ basal query 'CREATE Users PARENT Teams[id=3] [0="Sam",1="sam@acme.io"]'   # positional
@@ -408,6 +432,7 @@ cascade deleted 3 record(s) under 1 root(s) in "Accounts"
 
 ```
 SHOW LAYERS              height | name | records
+SHOW SCHEMA [Layer]      height | layer | attributes
 SHOW RECORDS [Layer]     all records, or one layer's
 SHOW BRANCHES            name | fork | head
 SHOW COMMITS             id | branch | author | summary | reason | timestamp
@@ -419,11 +444,18 @@ height | name | records
 0 | Accounts | 2
 1 | Teams | 3
 2 | Users | 4
+
+$ basal query 'SHOW SCHEMA'
+height | layer | attributes
+0 | Accounts | name, plan
+1 | Teams | name
+2 | Users | name, email, role, age
 ```
 
-`timestamp` is in Unix seconds. Attribute names aren't shown by `SHOW
-LAYERS`; use `basal inspect -header`
-([#18](https://github.com/Davidjustice28/basildb/issues/18)).
+`SHOW SCHEMA` reports the attribute names declared at `init`, so you don't
+have to provoke an error to find them. A layer that declares none shows an
+empty attribute list (use positional `0=`, `[0,1]` instead). `timestamp` is
+in Unix seconds.
 
 ### BRANCH statements
 
@@ -491,7 +523,7 @@ $ basal query -json 'GET Users[role=admin]' | jq '.rows | length'
 
 ## Output formats
 
-**Default (text).** Record rows look like this:
+**Default (table).** Record rows look like this:
 
 ```
 layer | id | slot | parent | children | attrs
@@ -501,23 +533,47 @@ Teams[3#0] parent=1 children=[6,7] "Engineering"
 `Teams[3#0]` = layer `Teams`, id `3`, slot `0`. `children` lists the
 child **ids**. Then come the attribute values, in declared order (or the
 columns you asked for). Catalog rows (`SHOW`, `BRANCH`) are joined with
-` | `. Writes end with `commit N on BRANCH | author | summary | reason`.
+` | `. Writes end with `commit N on BRANCH | author | summary | reason`,
+with the trailing empty fields dropped when a write carries no audit
+metadata: an unannotated write prints just `commit N on BRANCH`.
 
-**`-json`.** The full result:
+**`-format csv` / `-format tsv`.** One header row plus one row per
+result, suitable for spreadsheets, `xsv` or `duckdb`:
+
+```console
+$ basal query -format csv 'GET Users[name,email][role=admin]'
+layer,id,slot,parent,children,name,email
+Users,9,5,3,,Kim,kim@globex.io
+```
+
+`layer`, `id`, `slot`, `parent` and `children` always get their own
+columns. The attribute columns are named by the fields you selected, or
+by the layer's declared attribute names when you select none — extended
+with positional indices (`0`, `1`, …) past the declaration, which is how
+a layer that declares no names shows all of its attributes. `SHOW
+RECORDS` over several layers at once keeps every attribute in a single
+`attrs` column instead, since the layers don't share names. The human
+`message` and `commit` lines go to **stderr** in these modes, so stdout
+stays parseable.
+
+**`-json`** (alias: `-format json`). The full result:
 
 ```json
 {
   "columns": ["layer","id","slot","parent","children","attrs"],
-  "rows": [{"layer":"Users","id":9,"slot":3,"parent":5,"attrs":["Kim","kim@globex.io","admin","19"]}],
+  "fields": ["name","email"],
+  "rows": [{"layer":"Users","id":9,"slot":3,"parent":5,"children":[],"attrs":["Kim","kim@globex.io"]}],
   "message": "1 record(s) on branch \"main\"",
   "commit": {"id":13,"branch":"main","parent":11,"author":"…","summary":"…","reason":"…","timestamp":1792006982}
 }
 ```
 
-`commit` only appears for writes. Zero values are currently left out of
-rows: a missing `slot` means `0`, a missing `parent` means root, and a
-missing `children` means none
-([#7](https://github.com/Davidjustice28/basildb/issues/7)).
+`commit` only appears for writes. Record rows always carry `layer`,
+`id`, `slot`, `parent`, `children` and `attrs` — zeros included, empty
+lists as `[]` — so `"slot": 0` is distinguishable from a missing field
+([#7](https://github.com/Davidjustice28/basildb/issues/7)). `fields`
+names the values in each row's `attrs`, in order; it is absent when the
+layer declares no names.
 
 ---
 
@@ -534,6 +590,7 @@ Common errors:
 | Message | Fix |
 |---|---|
 | `PARENT Accounts[name=Acme] matched 2 records (need exactly 1)` | use `PARENT Accounts[id=N]` |
+| `layer "Users" is not the root layer; CREATE Users needs PARENT …` | add `PARENT Teams[filter]` — only the root layer creates without one |
 | `layer "Users" has no attribute "nickname" (declared: …)` | use a declared name or a positional index |
 | `path step "Users" must be the child layer of height 0 (got height 2)` | include every layer in the path: `Accounts -> Teams -> Users` |
 | `no records in "Users" matched [id=99]` | UPDATE/DELETE matched nothing |

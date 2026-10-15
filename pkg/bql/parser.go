@@ -179,10 +179,11 @@ type DeleteStmt struct {
 	Modifiers MutationModifiers
 }
 
-// ShowStmt lists database objects: LAYERS, BRANCHES, COMMITS or RECORDS.
+// ShowStmt lists database objects: LAYERS, BRANCHES, COMMITS, RECORDS or
+// SCHEMA.
 type ShowStmt struct {
-	Kind  string // "LAYERS" | "BRANCHES" | "COMMITS" | "RECORDS"
-	Layer string // for RECORDS
+	Kind  string // "LAYERS" | "BRANCHES" | "COMMITS" | "RECORDS" | "SCHEMA"
+	Layer string // for RECORDS and SCHEMA
 }
 
 // BranchStmt manages branches: LIST, USE, CREATE [FROM].
@@ -904,7 +905,7 @@ func (p *parser) parseDelete() (Statement, error) {
 }
 
 func (p *parser) parseShow() (Statement, error) {
-	what, err := p.expect(tokIdent, "LAYERS, BRANCHES, COMMITS or RECORDS")
+	what, err := p.expect(tokIdent, "LAYERS, BRANCHES, COMMITS, RECORDS or SCHEMA")
 	if err != nil {
 		return nil, err
 	}
@@ -912,13 +913,13 @@ func (p *parser) parseShow() (Statement, error) {
 	switch stmt.Kind {
 	case "LAYERS", "BRANCHES", "COMMITS":
 		return stmt, nil
-	case "RECORDS":
+	case "RECORDS", "SCHEMA":
 		if p.peek().kind == tokIdent {
 			stmt.Layer = p.next().text
 		}
 		return stmt, nil
 	default:
-		return nil, fmt.Errorf("bql: SHOW %s not supported (want LAYERS, BRANCHES, COMMITS or RECORDS)", what)
+		return nil, fmt.Errorf("bql: SHOW %s not supported (want LAYERS, BRANCHES, COMMITS, RECORDS or SCHEMA)", what)
 	}
 }
 

@@ -4,9 +4,11 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -16,15 +18,26 @@ import (
 	"basaldb/pkg/engine"
 )
 
+// Build metadata, injected at build time:
+//
+//	go build -ldflags "-X main.version=v1.2.3 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%FT%TZ)"
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 const usage = `basal - BasalDB single-file database utility
 
 Usage:
   basal init    [-file DATA.bsl] [-layers 0:Accounts,1:Teams,2:Users] [-author A -summary S -reason R]
   basal inspect [-file DATA.bsl] [-branch NAME] [-header] [-json]
-  basal query   [-file DATA.bsl] [-branch NAME] [-author A -summary S -reason R] 'BQL STATEMENT'
+  basal query   [-file DATA.bsl] [-branch NAME] [-format table|csv|tsv|json] [-author A -summary S -reason R] 'BQL STATEMENT'
   basal branch  list [-file DATA.bsl]
   basal branch  create NAME [-file DATA.bsl] [-from SRC] [-author A -summary S -reason R]
   basal config  list | get KEY | set KEY VALUE | unset KEY
+  basal version | --version
+  basal -help | --help
 
 Defaults (flags always win):
   -file   from 'basal config set file',   else ./basal.bsl
@@ -57,7 +70,9 @@ func main() {
 		err = cmdBranch(os.Args[2:])
 	case "config":
 		err = cmdConfig(os.Args[2:])
-	case "help", "-h", "--help":
+	case "version", "-version", "--version":
+		printVersion()
+	case "help", "-h", "--help", "-help":
 		fmt.Print(usage)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
@@ -67,6 +82,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "basal: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// printVersion reports the CLI build and the .bsl format it reads and
+// writes (useful in bug reports).
+func printVersion() {
+	fmt.Print(versionText())
+}
+
+func versionText() string {
+	return fmt.Sprintf("basal %s (commit %s, built %s)\nbsl format: %s (%s)\n",
+		version, commit, date, engine.CurrentVersion, engine.FormatMatrixSlottedPage)
 }
 
 // splitArgs separates flag arguments from positionals even when positionals
@@ -118,7 +144,7 @@ func cmdInit(args []string) error {
 		return err
 	}
 	defer db.Close()
-	fmt.Printf("initialized %s\nlayers: %s\ninitial commit: %d (%s / %s / %s)\n",
+	fmt.Printf("initialized %s\nlayers: %s\ninitial commit: %d (%s | %s | %s)\n",
 		path, *layers, 1, meta.Author, meta.Summary, meta.Reason)
 	return nil
 }
@@ -157,12 +183,27 @@ func cmdInspect(args []string) error {
 		return err
 	}
 	if *asJSON {
+		type layerInfo struct {
+			Height     int      `json:"height"`
+			Name       string   `json:"name"`
+			Records    int      `json:"records"`
+			Attributes []string `json:"attributes"`
+		}
+		layers := []layerInfo{}
+		for _, l := range snap.Layers() {
+			attrs := l.Attrs
+			if attrs == nil {
+				attrs = []string{}
+			}
+			layers = append(layers, layerInfo{Height: l.Height, Name: l.Name, Records: snap.Count(l.Height), Attributes: attrs})
+		}
 		out := map[string]any{
 			"path":     db.Path(),
 			"version":  db.Header().Version,
 			"format":   db.Header().Format,
 			"branch":   snap.Branch,
 			"commit":   snap.Commit,
+			"layers":   layers,
 			"branches": db.Branches(),
 		}
 		enc := json.NewEncoder(os.Stdout)
@@ -176,7 +217,11 @@ func cmdInspect(args []string) error {
 	fmt.Printf("branch:  %s @ commit %d\n", snap.Branch, snap.Commit)
 	fmt.Println("layers:")
 	for _, l := range snap.Layers() {
-		fmt.Printf("  %d:%-12s %d record(s)\n", l.Height, l.Name, snap.Count(l.Height))
+		fmt.Printf("  %d:%-12s %d record(s)", l.Height, l.Name, snap.Count(l.Height))
+		if len(l.Attrs) > 0 {
+			fmt.Printf("  attrs: %s", strings.Join(l.Attrs, ", "))
+		}
+		fmt.Println()
 	}
 	fmt.Println("branches:")
 	for _, b := range db.Branches() {
@@ -264,11 +309,20 @@ func cmdQuery(args []string) error {
 	author := fs.String("author", "", "stamps the commit block (required for BRANCH CREATE)")
 	summary := fs.String("summary", "", "stamps the commit block (required for BRANCH CREATE)")
 	reason := fs.String("reason", "", "stamps the commit block (required for BRANCH CREATE)")
-	asJSON := fs.Bool("json", false, "print JSON")
+	format := fs.String("format", "table", "output format: table, csv, tsv or json (-json is an alias for -format json)")
+	asJSON := fs.Bool("json", false, "print JSON (alias for -format json)")
 	flagArgs, posArgs := splitArgs(args, map[string]bool{"json": true})
 	_ = fs.Parse(flagArgs)
 	if len(posArgs) != 1 {
 		return fmt.Errorf("query: exactly one BQL statement required")
+	}
+	if *asJSON {
+		*format = "json"
+	}
+	switch *format {
+	case "table", "csv", "tsv", "json":
+	default:
+		return fmt.Errorf("query: unknown -format %q (want table, csv, tsv or json)", *format)
 	}
 	path, err := config.ResolveFile(*file)
 	if err != nil {
@@ -293,7 +347,7 @@ func cmdQuery(args []string) error {
 	if err != nil {
 		return err
 	}
-	return printResult(res, *asJSON)
+	return printResult(os.Stdout, os.Stderr, res, *format)
 }
 
 func cmdBranch(args []string) error {
@@ -355,17 +409,30 @@ func cmdBranch(args []string) error {
 	}
 }
 
-func printResult(res *bql.Result, asJSON bool) error {
-	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
+func printResult(out, notes io.Writer, res *bql.Result, format string) error {
+	switch format {
+	case "json":
+		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(res)
+	case "csv", "tsv":
+		if err := printDelimited(out, res, format); err != nil {
+			return err
+		}
+		// Keep stdout machine-readable: the human notes go to stderr.
+		if res.Message != "" {
+			fmt.Fprintln(notes, res.Message)
+		}
+		if res.Commit != nil {
+			fmt.Fprintln(notes, commitLine(res.Commit))
+		}
+		return nil
 	}
 	if len(res.Rows) > 0 {
-		fmt.Println(strings.Join(res.Columns, " | "))
+		fmt.Fprintln(out, strings.Join(res.Columns, " | "))
 		for _, r := range res.Rows {
 			if len(r.Cells) > 0 {
-				fmt.Println(strings.Join(r.Cells, " | "))
+				fmt.Fprintln(out, strings.Join(r.Cells, " | "))
 				continue
 			}
 			kids := make([]string, len(r.Children))
@@ -376,16 +443,89 @@ func printResult(res *bql.Result, asJSON bool) error {
 			for i, a := range r.Attrs {
 				attrs[i] = engine.Quote(a)
 			}
-			fmt.Printf("%s[%d#%d] parent=%d children=[%s] %s\n",
+			fmt.Fprintf(out, "%s[%d#%d] parent=%d children=[%s] %s\n",
 				r.Layer, r.ID, r.Slot, r.Parent, strings.Join(kids, ","), strings.Join(attrs, " "))
 		}
 	}
 	if res.Message != "" {
-		fmt.Println(res.Message)
+		fmt.Fprintln(out, res.Message)
 	}
 	if res.Commit != nil {
-		fmt.Printf("commit %d on %s | %s | %s | %s\n",
-			res.Commit.ID, res.Commit.Branch, res.Commit.Author, res.Commit.Summary, res.Commit.Reason)
+		fmt.Fprintln(out, commitLine(res.Commit))
 	}
 	return nil
+}
+
+// commitLine renders the write confirmation. Audit metadata is optional
+// on record writes, so trailing empty fields are dropped instead of
+// printing empty pipes: no metadata prints just "commit N on BRANCH" (#8).
+func commitLine(c *bql.CommitInfo) string {
+	parts := []string{c.Author, c.Summary, c.Reason}
+	last := -1
+	for i, p := range parts {
+		if p != "" {
+			last = i
+		}
+	}
+	line := fmt.Sprintf("commit %d on %s", c.ID, c.Branch)
+	for i := 0; i <= last; i++ {
+		line += " | " + parts[i]
+	}
+	return line
+}
+
+// printDelimited writes the result as CSV or TSV: a header row followed
+// by one row per result row (#28). Record rows keep layer/id/slot/parent/
+// children as their own columns; their attributes become one column per
+// named field when the result carries field names (a column selection or
+// declared attributes), otherwise a single quoted attrs column.
+func printDelimited(out io.Writer, res *bql.Result, format string) error {
+	w := csv.NewWriter(out)
+	if format == "tsv" {
+		w.Comma = '\t'
+	}
+	cols := append([]string(nil), res.Columns...)
+	if n := len(res.Fields); n > 0 && len(cols) > 0 && cols[len(cols)-1] == "attrs" {
+		cols = append(cols[:len(cols)-1], res.Fields...)
+	}
+	if len(cols) > 0 {
+		if err := w.Write(cols); err != nil {
+			return err
+		}
+	}
+	for _, r := range res.Rows {
+		if len(r.Cells) > 0 {
+			if err := w.Write(r.Cells); err != nil {
+				return err
+			}
+			continue
+		}
+		kids := make([]string, len(r.Children))
+		for i, c := range r.Children {
+			kids[i] = strconv.FormatUint(c, 10)
+		}
+		rec := []string{
+			r.Layer,
+			strconv.FormatUint(r.ID, 10),
+			strconv.FormatUint(r.Slot, 10),
+			strconv.FormatUint(r.Parent, 10),
+			strings.Join(kids, ","),
+		}
+		if n := len(res.Fields); n > 0 {
+			cells := make([]string, n)
+			for i := 0; i < n && i < len(r.Attrs); i++ {
+				cells[i] = r.Attrs[i]
+			}
+			rec = append(rec, cells...)
+		} else {
+			// One column holding every attribute, space-separated; the CSV
+			// writer quotes the cell when a value needs it.
+			rec = append(rec, strings.Join(r.Attrs, " "))
+		}
+		if err := w.Write(rec); err != nil {
+			return err
+		}
+	}
+	w.Flush()
+	return w.Error()
 }
