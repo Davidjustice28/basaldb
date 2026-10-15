@@ -502,6 +502,8 @@ shape.
 
 ## How the file works
 
+(Deeper dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).)
+
 A `.bsl` file has three parts:
 
 1. **A readable header**: the file signature, layer definitions and
