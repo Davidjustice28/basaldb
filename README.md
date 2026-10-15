@@ -1,12 +1,14 @@
 # BasalDB
 
-**Git-style memory for AI agents. One file.**
+**Agent memory in a single file.**
 
-BasalDB is a small embedded database for data that lives in trees:
-the runs, facts and skills an agent accumulates. Every write records
-who made it and why, you can branch the data to try something and throw
-it away, and one `DELETE` forgets a whole subtree. The database is a
-single `.bsl` file with no server to install.
+Store what your agent did, what it learned and how it does things, as
+trees with a record of who wrote each entry and why. Recall by path,
+branch to experiment, and forget a user in one step. BasalDB is
+embedded: it runs inside your agent's process with no database server
+to set up, and keeps one `.bsl` file per agent or per user that you can
+copy, ship or delete. When you do want a server, `basald` serves the
+same file over HTTP ([REST](#using-it-from-other-languages-rest)).
 
 ```console
 $ basal init -file mem.bsl -layers "0:Users(name),1:Topics(name),2:Facts(text,source,confidence)"
@@ -522,8 +524,23 @@ what happened but can't prove nobody edited the file
 
 ## How it compares
 
-BasalDB is deliberately narrow. For most jobs an established database
-is the better choice. This table is meant to help you choose honestly.
+BasalDB is deliberately narrow: **embedded, tree-shaped memory for an
+agent, in one file.** For most jobs an established database is the
+better choice. These tables are meant to help you choose honestly.
+
+### For agent memory
+
+| Option | Best for | Pick it instead of BasalDB when… |
+|---|---|---|
+| **BasalDB** | Per-agent or per-user memory, traces and skills that are naturally trees; read by subtree, forgotten as a unit, with who/why on every write | — |
+| **SQLite (+ sqlite-vec)** | The default embedded store; DIY memory tables with vector search via an extension | you need full SQL, joins across unrelated data, or a mature ecosystem today. This is BasalDB's closest alternative: it's embedded too, but trees need recursive queries and there's no built-in provenance, branching or one-step forget |
+| **Dolt** | A versioned SQL database (branch, diff, merge) run as a server | you want git-style versioning on relational tables, with merge working today (#20 is still open here) |
+| **Memory frameworks** (Mem0, Zep, Letta, …) | LLM-driven extraction and retrieval of memories from conversations, as a library or service | you want memory managed for you, end to end. They can sit on top of a store; BasalDB is the store |
+| **Vector databases** (Pinecone, Qdrant, Weaviate, Milvus, pgvector) | Semantic search over large embedding collections | retrieval by similarity is the main job. BasalDB has no similarity search yet ([#49](https://github.com/Davidjustice28/basildb/issues/49)) |
+| **Forkable Postgres** (Neon, Tiger Data, …) | Giving each agent task its own disposable copy of a production Postgres | the agent works against your app's existing relational data |
+| **Multi-model / graph** (SurrealDB, Neo4j) | Memory with many cross-links between entities | facts relate to each other across the tree. BasalDB records have one parent and no links yet ([#54](https://github.com/Davidjustice28/basildb/issues/54)) |
+
+### General-purpose
 
 | Database | Best for | Pros | Cons |
 |---|---|---|---|
@@ -536,9 +553,10 @@ is the better choice. This table is meant to help you choose honestly.
 | **Neo4j** | Many-hop relationships in any direction | Arbitrary graph traversal | Heavy; overkill for strict parent-child trees |
 | **RocksDB / LevelDB** | Raw key-value speed | Extremely fast get/put | No structure or query language |
 
-Rule of thumb: **hierarchies that get deleted or handed around as a unit
-→ BasalDB. Almost everything else → SQLite or PostgreSQL. Number
-crunching → DuckDB.**
+Rule of thumb: **memory, traces or skills that live with one agent or
+user and get read, branched or forgotten as a unit → BasalDB.**
+Relational app data → SQLite or PostgreSQL. Large-scale semantic search
+→ a vector database. Number crunching → DuckDB.
 
 ## Where BasalDB fits
 
