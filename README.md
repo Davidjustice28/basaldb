@@ -40,8 +40,8 @@ cascade deleted 3 record(s) under 1 root(s) in "Users"
 |---|---|---|---|
 | **Episodic**: what happened | session → task → step traces, crawl runs | trees and `->` paths; who/why on every write; branches for retries | ✅ today |
 | **Semantic**: what it knows | user → topic → fact, page → findings | path recall, one-step forget, provenance per fact | ✅ today |
-| | ask a question, get the relevant facts for *this* user only | RAG search scoped to a subtree, `[near="…",k=5]` | 🛣️ planned ([#49](https://github.com/Davidjustice28/basildb/issues/49)) |
-| | raw page HTML, screenshots, long transcripts | blob attributes stored out-of-line | 🛣️ planned ([#50](https://github.com/Davidjustice28/basildb/issues/50)) |
+| | ask a question, get the relevant facts for *this* user only | RAG search scoped to a subtree, `[near="…",k=5]` | 🛣️ planned ([#49](https://github.com/Davidjustice28/basaldb/issues/49)) |
+| | raw page HTML, screenshots, long transcripts | blob attributes stored out-of-line | 🛣️ planned ([#50](https://github.com/Davidjustice28/basaldb/issues/50)) |
 | **Procedural**: how to do things | namespace → skill → files | versioned via the commit log; whole skill loads in ~6 µs | ✅ today |
 
 See [AI agents: traces, flows and memory](#ai-agents-traces-flows-and-memory)
@@ -54,21 +54,21 @@ for full walkthroughs. BasalDB also works for any other data that nests
 > risks, fix first:
 > - **An attribute value over 64 KB, or more than 65,535 children under one
 >   record, commits without error but makes the file unopenable**
->   ([#44](https://github.com/Davidjustice28/basildb/issues/44)). Keep values
+>   ([#44](https://github.com/Davidjustice28/basaldb/issues/44)). Keep values
 >   small until this is fixed.
 > - **Don't let several processes write to the same file at once**: writes
->   can be lost silently ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+>   can be lost silently ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 >   Use one writer, or route writes through `basald`.
 > - The whole database is held in RAM, at about 2–3× the data size
->   ([#37](https://github.com/Davidjustice28/basildb/issues/37)).
+>   ([#37](https://github.com/Davidjustice28/basaldb/issues/37)).
 >
 > **Performance:** path recall, id lookups and subtree deletes run in
 > microseconds to about a millisecond at 250k–500k records in-process.
 > Lookups by attribute value are full scans until
-> [#45](https://github.com/Davidjustice28/basildb/issues/45) lands. See
+> [#45](https://github.com/Davidjustice28/basaldb/issues/45) lands. See
 > [BENCHMARKS.md](BENCHMARKS.md), the issues labeled
-> [`priority: high`](https://github.com/Davidjustice28/basildb/labels/priority%3A%20high),
-> and the [scalability roadmap (#42)](https://github.com/Davidjustice28/basildb/issues/42).
+> [`priority: high`](https://github.com/Davidjustice28/basaldb/labels/priority%3A%20high),
+> and the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42).
 
 ---
 
@@ -116,19 +116,19 @@ tracking issue.
 
 | You might want to… | Status |
 |---|---|
-| Write from several processes at once | ⚠️ unsafe: writes can be lost without an error ([#4](https://github.com/Davidjustice28/basildb/issues/4)) |
-| Run several statements in one transaction | one statement per call ([#22](https://github.com/Davidjustice28/basildb/issues/22), [#1](https://github.com/Davidjustice28/basildb/issues/1)) |
-| OR / IN filters, text search | AND equality/comparison only ([#9](https://github.com/Davidjustice28/basildb/issues/9), [#10](https://github.com/Davidjustice28/basildb/issues/10)) |
-| Sort by an attribute, paginate with offset | sort by id only, `limit` only ([#11](https://github.com/Davidjustice28/basildb/issues/11)) |
-| COUNT / aggregates | no ([#12](https://github.com/Davidjustice28/basildb/issues/12)) |
-| Walk up the tree, skip layers, get parent columns in the same row | down, one layer at a time, leaf columns only ([#13](https://github.com/Davidjustice28/basildb/issues/13), [#14](https://github.com/Davidjustice28/basildb/issues/14), [#3](https://github.com/Davidjustice28/basildb/issues/3)) |
-| Move a record to a new parent | no ([#15](https://github.com/Davidjustice28/basildb/issues/15)) |
-| Typed attributes, required/unique | every value is a string ([#16](https://github.com/Davidjustice28/basildb/issues/16)) |
-| Change layers/attributes after `init` | schema is fixed at init ([#17](https://github.com/Davidjustice28/basildb/issues/17), [#29](https://github.com/Davidjustice28/basildb/issues/29), [#30](https://github.com/Davidjustice28/basildb/issues/30)) |
-| Delete, diff or merge branches | create and read only ([#19](https://github.com/Davidjustice28/basildb/issues/19), [#20](https://github.com/Davidjustice28/basildb/issues/20)) |
-| Query the past / undo a commit | no ([#21](https://github.com/Davidjustice28/basildb/issues/21)) |
-| Export / import a whole database as JSON or CSV | CSV/TSV query output works ([#28](https://github.com/Davidjustice28/basildb/issues/28)); no file export/import yet ([#24](https://github.com/Davidjustice28/basildb/issues/24)) |
-| Verify or compact the file | no ([#25](https://github.com/Davidjustice28/basildb/issues/25), [#26](https://github.com/Davidjustice28/basildb/issues/26)) |
+| Write from several processes at once | ⚠️ unsafe: writes can be lost without an error ([#4](https://github.com/Davidjustice28/basaldb/issues/4)) |
+| Run several statements in one transaction | one statement per call ([#22](https://github.com/Davidjustice28/basaldb/issues/22), [#1](https://github.com/Davidjustice28/basaldb/issues/1)) |
+| OR / IN filters, text search | AND equality/comparison only ([#9](https://github.com/Davidjustice28/basaldb/issues/9), [#10](https://github.com/Davidjustice28/basaldb/issues/10)) |
+| Sort by an attribute, paginate with offset | sort by id only, `limit` only ([#11](https://github.com/Davidjustice28/basaldb/issues/11)) |
+| COUNT / aggregates | no ([#12](https://github.com/Davidjustice28/basaldb/issues/12)) |
+| Walk up the tree, skip layers, get parent columns in the same row | down, one layer at a time, leaf columns only ([#13](https://github.com/Davidjustice28/basaldb/issues/13), [#14](https://github.com/Davidjustice28/basaldb/issues/14), [#3](https://github.com/Davidjustice28/basaldb/issues/3)) |
+| Move a record to a new parent | no ([#15](https://github.com/Davidjustice28/basaldb/issues/15)) |
+| Typed attributes, required/unique | every value is a string ([#16](https://github.com/Davidjustice28/basaldb/issues/16)) |
+| Change layers/attributes after `init` | schema is fixed at init ([#17](https://github.com/Davidjustice28/basaldb/issues/17), [#29](https://github.com/Davidjustice28/basaldb/issues/29), [#30](https://github.com/Davidjustice28/basaldb/issues/30)) |
+| Delete, diff or merge branches | create and read only ([#19](https://github.com/Davidjustice28/basaldb/issues/19), [#20](https://github.com/Davidjustice28/basaldb/issues/20)) |
+| Query the past / undo a commit | no ([#21](https://github.com/Davidjustice28/basaldb/issues/21)) |
+| Export / import a whole database as JSON or CSV | CSV/TSV query output works ([#28](https://github.com/Davidjustice28/basaldb/issues/28)); no file export/import yet ([#24](https://github.com/Davidjustice28/basaldb/issues/24)) |
+| Verify or compact the file | no ([#25](https://github.com/Davidjustice28/basaldb/issues/25), [#26](https://github.com/Davidjustice28/basaldb/issues/26)) |
 
 Child layers always need `PARENT`: a `CREATE` outside the root layer
 without one is an error, so no record can end up unreachable by a
@@ -140,9 +140,16 @@ cascade delete.
 
 Requires Go 1.21+.
 
+**Names at a glance:** the project is **BasalDB**; the repo and Go
+module are `basaldb`; the CLI is `basal`, the HTTP server is `basald`
+and the benchmark is `basal-bench`; database files end in `.bsl`; the
+query language is BasalQL (**BQL**). "Branch" in these docs means a
+BasalDB data branch inside a `.bsl` file (`basal branch create`), not a
+git branch.
+
 ```console
-$ git clone https://github.com/Davidjustice28/basildb.git
-$ cd basildb
+$ git clone https://github.com/Davidjustice28/basaldb.git
+$ cd basaldb
 $ go install ./cmd/basal ./cmd/basald     # installs into $(go env GOPATH)/bin
 # or build a local binary:
 $ go build -o basal ./cmd/basal
@@ -272,7 +279,7 @@ Accounts[1#0] parent=0 children=[3,4] "Acme Corp" "pro"
 Accounts[2#1] parent=0 children=[5] "Globex" "free"
 ```
 
-(Branches can't be merged back yet. See [#20](https://github.com/Davidjustice28/basildb/issues/20).)
+(Branches can't be merged back yet. See [#20](https://github.com/Davidjustice28/basaldb/issues/20).)
 
 ### 6. Record who did it and why
 
@@ -375,7 +382,7 @@ Endpoints: `/v1/health`, `/v1/meta`, `/v1/query` (reads only),
 to read from a branch. See [CLI.md](CLI.md#rest-api-basald).
 
 > Run **either** `basald` **or** CLI writes against a file, not both at
-> once ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+> once ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 
 ---
 
@@ -470,24 +477,24 @@ cascade deleted 4 record(s) under 1 root(s) in "Users"
   similarity search yet. Store embeddings in a vector store keyed by the
   BasalDB record `id`; BasalDB holds the structure and provenance. Native
   RAG search scoped to a subtree is planned in
-  [#49](https://github.com/Davidjustice28/basildb/issues/49).
+  [#49](https://github.com/Davidjustice28/basaldb/issues/49).
 - **Keep large bodies out of records.** Store page HTML or long
   transcripts in files and keep the path, hash and analysis in BasalDB.
   Values over 64 KB currently corrupt the file
-  ([#44](https://github.com/Davidjustice28/basildb/issues/44)); blob
-  attributes are planned in [#50](https://github.com/Davidjustice28/basildb/issues/50).
+  ([#44](https://github.com/Davidjustice28/basaldb/issues/44)); blob
+  attributes are planned in [#50](https://github.com/Davidjustice28/basaldb/issues/50).
 - **Use branches for speculative memory.** Let an agent write
   "hypotheses" on a branch and keep only what's confirmed.
 
 **Current gaps for agent workloads:** only one process can write to a
 file at a time, so give each agent its own file or route writes through
-`basald` ([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+`basald` ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 Branches can't be merged back yet
-([#20](https://github.com/Davidjustice28/basildb/issues/20)), and there's
-no text search ([#10](https://github.com/Davidjustice28/basildb/issues/10)),
-moving records ([#15](https://github.com/Davidjustice28/basildb/issues/15))
+([#20](https://github.com/Davidjustice28/basaldb/issues/20)), and there's
+no text search ([#10](https://github.com/Davidjustice28/basaldb/issues/10)),
+moving records ([#15](https://github.com/Davidjustice28/basaldb/issues/15))
 or reading past states
-([#21](https://github.com/Davidjustice28/basildb/issues/21)). Depth is
+([#21](https://github.com/Davidjustice28/basaldb/issues/21)). Depth is
 fixed by the layer stack, so pick it to match your trace or memory
 shape.
 
@@ -518,7 +525,7 @@ A `.bsl` file has three parts:
 
 The log is append-only but not yet signed or hash-chained, so it shows
 what happened but can't prove nobody edited the file
-([#6](https://github.com/Davidjustice28/basildb/issues/6)).
+([#6](https://github.com/Davidjustice28/basaldb/issues/6)).
 
 ---
 
@@ -536,9 +543,9 @@ better choice. These tables are meant to help you choose honestly.
 | **SQLite (+ sqlite-vec)** | The default embedded store; DIY memory tables with vector search via an extension | you need full SQL, joins across unrelated data, or a mature ecosystem today. This is BasalDB's closest alternative: it's embedded too, but trees need recursive queries and there's no built-in provenance, branching or one-step forget |
 | **Dolt** | A versioned SQL database (branch, diff, merge) run as a server | you want git-style versioning on relational tables, with merge working today (#20 is still open here) |
 | **Memory frameworks** (Mem0, Zep, Letta, …) | LLM-driven extraction and retrieval of memories from conversations, as a library or service | you want memory managed for you, end to end. They can sit on top of a store; BasalDB is the store |
-| **Vector databases** (Pinecone, Qdrant, Weaviate, Milvus, pgvector) | Semantic search over large embedding collections | retrieval by similarity is the main job. BasalDB has no similarity search yet ([#49](https://github.com/Davidjustice28/basildb/issues/49)) |
+| **Vector databases** (Pinecone, Qdrant, Weaviate, Milvus, pgvector) | Semantic search over large embedding collections | retrieval by similarity is the main job. BasalDB has no similarity search yet ([#49](https://github.com/Davidjustice28/basaldb/issues/49)) |
 | **Forkable Postgres** (Neon, Tiger Data, …) | Giving each agent task its own disposable copy of a production Postgres | the agent works against your app's existing relational data |
-| **Multi-model / graph** (SurrealDB, Neo4j) | Memory with many cross-links between entities | facts relate to each other across the tree. BasalDB records have one parent and no links yet ([#54](https://github.com/Davidjustice28/basildb/issues/54)) |
+| **Multi-model / graph** (SurrealDB, Neo4j) | Memory with many cross-links between entities | facts relate to each other across the tree. BasalDB records have one parent and no links yet ([#54](https://github.com/Davidjustice28/basaldb/issues/54)) |
 
 ### General-purpose
 
@@ -571,7 +578,7 @@ Relational app data → SQLite or PostgreSQL. Large-scale semantic search
   file is one file.
 * **Org charts and group membership.** "Who's under this manager" is a
   path query; removing a manager removes their whole branch. (Moving
-  people to a new parent is planned in [#15](https://github.com/Davidjustice28/basildb/issues/15).)
+  people to a new parent is planned in [#15](https://github.com/Davidjustice28/basaldb/issues/15).)
 * **Bills of materials and nested config.** A product contains
   assemblies, which contain parts.
 * **Audited settings and permission trees.** Every write is in a

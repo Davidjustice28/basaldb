@@ -148,8 +148,8 @@ Quote the whole value in the shell: the parentheses are special
 characters.
 
 > Layers and attribute names **can't be changed after init** yet
-> ([#17](https://github.com/Davidjustice28/basildb/issues/17),
-> [#29](https://github.com/Davidjustice28/basildb/issues/29)). Declare
+> ([#17](https://github.com/Davidjustice28/basaldb/issues/17),
+> [#29](https://github.com/Davidjustice28/basaldb/issues/29)). Declare
 > every attribute you expect to need.
 
 ### query
@@ -174,7 +174,7 @@ basal query [-file F] [-branch B] [-format table|csv|tsv|json] [-author A -summa
 - `CREATE` / `UPDATE` / `DELETE` work without audit flags; the commit
   then has empty audit fields. `BRANCH CREATE` **requires** them.
 - Only one statement per call. A `;`-separated script is rejected
-  ([#22](https://github.com/Davidjustice28/basildb/issues/22)).
+  ([#22](https://github.com/Davidjustice28/basaldb/issues/22)).
 
 ### inspect
 
@@ -224,7 +224,7 @@ JournalStart:7747
 To see the operations each commit performed, read the log directly
 (it's plain text): `strings acme.bsl | less`, or use REST
 `/v1/commits`. The CLI doesn't display ops yet
-([#6](https://github.com/Davidjustice28/basildb/issues/6)).
+([#6](https://github.com/Davidjustice28/basaldb/issues/6)).
 
 ### branch
 
@@ -257,8 +257,8 @@ commit.
 Use a branch with `-branch NAME` on `query` / `inspect`, or set it as
 the default with `basal config set branch NAME`. Delete, rename, diff
 and merge aren't available yet
-([#19](https://github.com/Davidjustice28/basildb/issues/19),
-[#20](https://github.com/Davidjustice28/basildb/issues/20)).
+([#19](https://github.com/Davidjustice28/basaldb/issues/19),
+[#20](https://github.com/Davidjustice28/basaldb/issues/20)).
 
 ### version and help
 
@@ -319,8 +319,8 @@ Negative numbers are allowed.
 
 Comparisons are numeric when both sides look like numbers, and string
 comparisons otherwise. There's no OR, IN, LIKE or contains yet
-([#9](https://github.com/Davidjustice28/basildb/issues/9),
-[#10](https://github.com/Davidjustice28/basildb/issues/10)).
+([#9](https://github.com/Davidjustice28/basaldb/issues/9),
+[#10](https://github.com/Davidjustice28/basaldb/issues/10)).
 
 ### GET
 
@@ -353,14 +353,14 @@ Users[7#1] parent=3 children=[] "Elena" "elena@acme.io"
 
 Things to know:
 - Only the **last** layer's records are returned
-  ([#3](https://github.com/Davidjustice28/basildb/issues/3) adds parent
+  ([#3](https://github.com/Davidjustice28/basaldb/issues/3) adds parent
   columns).
 - Skipping a layer (`Accounts -> Users`) is an error
-  ([#14](https://github.com/Davidjustice28/basildb/issues/14)).
+  ([#14](https://github.com/Davidjustice28/basaldb/issues/14)).
 - You can't walk upward yet. Use the `parent` id with `[id=…]`
-  ([#13](https://github.com/Davidjustice28/basildb/issues/13)).
+  ([#13](https://github.com/Davidjustice28/basaldb/issues/13)).
 - `sort` orders by record **id** only; `limit` is applied last
-  ([#11](https://github.com/Davidjustice28/basildb/issues/11)).
+  ([#11](https://github.com/Davidjustice28/basaldb/issues/11)).
 - No matches is **not** an error: you get `0 record(s)`.
 
 ### CREATE
@@ -386,10 +386,10 @@ $ basal query 'CREATE Users PARENT Teams[id=3] [0="Sam",1="sam@acme.io"]'   # po
 - Attributes you leave out are stored as `""`. Unknown names are
   rejected.
 - All values are stored as strings (`age="abc"` is accepted;
-  [#16](https://github.com/Davidjustice28/basildb/issues/16)).
+  [#16](https://github.com/Davidjustice28/basaldb/issues/16)).
 - Always use `PARENT` for non-root layers. A child-layer record created
   without one is an orphan
-  ([#5](https://github.com/Davidjustice28/basildb/issues/5)).
+  ([#5](https://github.com/Davidjustice28/basaldb/issues/5)).
 
 ### UPDATE
 
@@ -409,7 +409,7 @@ updated 1 record(s) in "Users"
   filter) updates the whole layer.
 - No matches → error (`no records in "Users" matched [...]`).
 - `id`, `slot` and `parent` can't be changed (moving records is
-  [#15](https://github.com/Davidjustice28/basildb/issues/15)).
+  [#15](https://github.com/Davidjustice28/basaldb/issues/15)).
 
 ### DELETE
 
@@ -571,7 +571,7 @@ stays parseable.
 `commit` only appears for writes. Record rows always carry `layer`,
 `id`, `slot`, `parent`, `children` and `attrs` — zeros included, empty
 lists as `[]` — so `"slot": 0` is distinguishable from a missing field
-([#7](https://github.com/Davidjustice28/basildb/issues/7)). `fields`
+([#7](https://github.com/Davidjustice28/basaldb/issues/7)). `fields`
 names the values in each row's `attrs`, in order; it is absent when the
 layer declares no names.
 
@@ -641,7 +641,7 @@ $ curl 'localhost:8080/v1/commits?branch=main'
 
 Errors come back as `{"error":"…"}` with status `400` / `405`. Don't run
 CLI writes against a file while `basald` is serving it
-([#4](https://github.com/Davidjustice28/basildb/issues/4)).
+([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 
 ---
 

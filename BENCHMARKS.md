@@ -2,7 +2,7 @@
 
 Real measurements of BasalDB, produced by [`cmd/basal-bench`](cmd/basal-bench/main.go).
 The goal is to make BasalDB scale for trace and agent-memory workloads.
-Progress is tracked in the [scalability roadmap (#42)](https://github.com/Davidjustice28/basildb/issues/42).
+Progress is tracked in the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42).
 
 ## Running it
 
@@ -167,6 +167,6 @@ ingest (#39).
 
 **Today:** good for internal testing up to about 50k records per file,
 with a single writer, ideally through `basald` or the Go packages
-rather than the CLI. See [#42](https://github.com/Davidjustice28/basildb/issues/42)
+rather than the CLI. See [#42](https://github.com/Davidjustice28/basaldb/issues/42)
 for the plan and targets (10M+ records, ≥100k records/s ingest, <50 µs
 indexed lookups, bounded RAM).
