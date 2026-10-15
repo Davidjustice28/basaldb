@@ -1,6 +1,7 @@
 package bql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -686,5 +687,57 @@ func TestExecDeleteByFilterMultipleRoots(t *testing.T) {
 	res = mustExec(t, ctx, `GET Users[name=Zoe]`)
 	if len(res.Rows) != 1 || res.Rows[0].Parent != 2 {
 		t.Errorf("create under filtered parent = %+v", res.Rows)
+	}
+}
+
+// Point lookups resolve [id=N], [slot=N] and [parent=N] through the engine
+// indexes instead of scanning the layer (issue #33). Results must match
+// the scan path exactly: hits, misses, combined filters, mutations.
+func TestIndexedPointLookups(t *testing.T) {
+	_, ctx := setupDB(t)
+
+	// id
+	res := mustExec(t, ctx, `GET Users[id=6]`)
+	if len(res.Rows) != 1 || res.Rows[0].Attrs[0] != "Alex" {
+		t.Fatalf("GET Users[id=6] rows = %+v", res.Rows)
+	}
+	if res = mustExec(t, ctx, `GET Users[id=9999]`); len(res.Rows) != 0 {
+		t.Errorf("missing id returned %d rows", len(res.Rows))
+	}
+
+	// slot
+	slot := mustExec(t, ctx, `GET Users[id=8]`).Rows[0].Slot
+	res = mustExec(t, ctx, fmt.Sprintf(`GET Users[slot=%d]`, slot))
+	if len(res.Rows) != 1 || res.Rows[0].Attrs[0] != "Tony" {
+		t.Fatalf("GET Users[slot=%d] rows = %+v", slot, res.Rows)
+	}
+
+	// parent: children of a record live one layer down.
+	res = mustExec(t, ctx, `GET Users[parent=3]`)
+	if len(res.Rows) != 2 {
+		t.Fatalf("GET Users[parent=3] rows = %d, want 2", len(res.Rows))
+	}
+
+	// Combined indexed + attribute filters keep scan semantics.
+	res = mustExec(t, ctx, `GET Users[parent=3][0=Alex]`)
+	if len(res.Rows) != 1 || res.Rows[0].Attrs[0] != "Alex" {
+		t.Fatalf("combined filter rows = %+v", res.Rows)
+	}
+	if res = mustExec(t, ctx, `GET Users[parent=3][0=Nobody]`); len(res.Rows) != 0 {
+		t.Errorf("combined miss returned %d rows", len(res.Rows))
+	}
+
+	// Mutations resolve through the same fast path.
+	mustExec(t, ctx, `UPDATE Users[id=8][1=tony@stark.io]`)
+	res = mustExec(t, ctx, `GET Users[id=8]`)
+	if len(res.Rows) != 1 || res.Rows[0].Attrs[1] != "tony@stark.io" {
+		t.Fatalf("update via point lookup rows = %+v", res.Rows)
+	}
+	mustExec(t, ctx, `DELETE Users[id=7]`)
+	if res = mustExec(t, ctx, `GET Users[id=7]`); len(res.Rows) != 0 {
+		t.Errorf("deleted id returned %d rows", len(res.Rows))
+	}
+	if res = mustExec(t, ctx, `GET Users`); len(res.Rows) != 2 {
+		t.Errorf("users after point delete = %d, want 2", len(res.Rows))
 	}
 }

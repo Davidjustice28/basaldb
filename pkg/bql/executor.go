@@ -107,18 +107,96 @@ func layerHeight(layers []engine.Layer, name string) (int, bool) {
 	return 0, false
 }
 
+// indexedEq returns the first equality filter on a builtin record field
+// (id, slot, parent) with a parseable value. Those fields resolve through
+// the engine indexes in constant time (issue #33); every other filter
+// falls back to a layer scan. A non-numeric value falls back too, so the
+// usual "needs a number" error still surfaces from filterRecords.
+func indexedEq(filters []Filter) (field string, value uint64, ok bool) {
+	for _, f := range filters {
+		if f.Op != OpEq {
+			continue
+		}
+		switch strings.ToLower(f.Field) {
+		case "id", "slot", "parent":
+			n, err := strconv.ParseUint(f.Value, 10, 64)
+			if err != nil {
+				return "", 0, false
+			}
+			return strings.ToLower(f.Field), n, true
+		}
+	}
+	return "", 0, false
+}
+
+// snapPoint resolves a step's filters through the engine indexes when the
+// step pins a builtin field to one value: id=N via the id index, slot=N
+// via the slot lookup, parent=N via the parent's child pointer array. The
+// second return value reports whether the fast path applied; callers still
+// run filterRecords over the candidates, so combined filters keep their
+// exact semantics.
+func snapPoint(snap *engine.Snapshot, filters []Filter, h int) ([]*engine.Record, bool) {
+	field, n, ok := indexedEq(filters)
+	if !ok {
+		return nil, false
+	}
+	switch field {
+	case "id":
+		if r, found := snap.Record(h, n); found {
+			return []*engine.Record{r}, true
+		}
+		return nil, true
+	case "slot":
+		if r, found := snap.RecordBySlot(h, n); found {
+			return []*engine.Record{r}, true
+		}
+		return nil, true
+	default: // parent: a record's children live one layer up
+		if n == 0 || h == 0 {
+			return nil, false
+		}
+		return snap.Children(h-1, n), true
+	}
+}
+
 // matchRef resolves a RecordRef inside a write transaction to the
 // records matching its filters.
 func matchRef(tx *engine.WriteTx, ref RecordRef) ([]*engine.Record, error) {
-	h, ok := layerHeight(tx.Layers(), ref.Layer)
+	layers := tx.Layers()
+	h, ok := layerHeight(layers, ref.Layer)
 	if !ok {
 		return nil, fmt.Errorf("bql: unknown layer %q", ref.Layer)
 	}
-	all, err := tx.Records(ref.Layer)
+	all, err := txRecords(tx, layers, h, ref)
 	if err != nil {
 		return nil, err
 	}
-	return filterRecords(tx.Layers(), h, all, ref.Filters)
+	return filterRecords(layers, h, all, ref.Filters)
+}
+
+// txRecords lists the candidate records for a reference, using the engine
+// indexes for builtin-field equality filters (see snapPoint) and a full
+// layer scan otherwise.
+func txRecords(tx *engine.WriteTx, layers []engine.Layer, h int, ref RecordRef) ([]*engine.Record, error) {
+	if field, n, ok := indexedEq(ref.Filters); ok {
+		switch field {
+		case "id":
+			if r, found := tx.Record(ref.Layer, n); found {
+				return []*engine.Record{r}, nil
+			}
+			return nil, nil
+		case "slot":
+			if r, found := tx.RecordBySlot(ref.Layer, n); found {
+				return []*engine.Record{r}, nil
+			}
+			return nil, nil
+		case "parent":
+			if n != 0 && h > 0 {
+				return tx.Children(layers[h-1].Name, n)
+			}
+		}
+	}
+	return tx.Records(ref.Layer)
 }
 
 // applyMutationMods orders the matched records by id (when sort is set)
@@ -165,7 +243,13 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	if !ok {
 		return nil, fmt.Errorf("bql: unknown layer %q", first.Layer)
 	}
-	cur, err := filterRecords(snap.Layers(), h, snap.Records(h), first.Filters)
+	var base []*engine.Record
+	if cands, point := snapPoint(snap, first.Filters, h); point {
+		base = cands
+	} else {
+		base = snap.Records(h)
+	}
+	cur, err := filterRecords(snap.Layers(), h, base, first.Filters)
 	if err != nil {
 		return nil, err
 	}

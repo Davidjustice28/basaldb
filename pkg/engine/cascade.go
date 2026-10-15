@@ -112,9 +112,9 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 			continue
 		}
 		// The BFS already collected every deleted id at this height, so
-		// index cleanup is a direct map delete per record: O(subtree).
+		// index cleanup is a direct drop per record: O(subtree).
 		for _, id := range perLayerIDs[height] {
-			delete(ls.idIndex, id)
+			ls.dropID(id)
 		}
 	}
 	return deleted, nil

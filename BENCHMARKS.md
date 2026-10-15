@@ -96,14 +96,68 @@ fan-out 10 x 20 (211k records):
 - The CLI's remaining ~200 ms is loading the whole file into RAM per
   call (#37), not rewriting it.
 
+## Update: 2026-10-14 — #33 and #34 fixed (Phase 1 of #42)
+
+**#34 (copy-on-write overlay layers):** `Begin` no longer clones every
+layer's page and id-index maps. A transaction gets an empty overlay that
+records only what it changes; commits publish shallow overlays and
+flatten them only once they are deep or dense, so the copy work is
+amortized O(1) per commit instead of O(total records).
+
+**#33 (indexed point lookups):** BQL resolves `[id=N]`, `[slot=N]` and
+`[parent=N]` through the engine indexes instead of scanning and sorting
+the whole layer, and `Records` walks pages in slot order instead of
+collecting and sorting every record.
+
+Apple M1 (8 cores), Go 1.21.3: old binary at `31d8473` vs fixed tree,
+measured back-to-back on the same machine, fan-out 10 x 20:
+
+| 211k records | old (`31d8473`) | fixed | |
+|---|---|---|---|
+| bulk load | 42.6k rec/s | 146k rec/s | 3.4x |
+| `GET Users[id=N]` | 46.8 ms | 2 µs | ~23,000x |
+| `GET Accounts[id=N]` | 112 µs | 1 µs | 112x |
+| subtree walk | 145 µs | 32 µs | 4.5x |
+| parallel subtree reads (8 goroutines) | 30.6k q/s | 88.4k q/s | 2.9x |
+| single `CREATE` | 10.7 ms | 18 µs | ~590x |
+| `UPDATE [id=N]` | 52 ms | 14 µs | ~3,700x |
+| delete 211-record subtree | 10.1 ms | 670 µs | 15x |
+| `GET Users[email=X]` (unindexed scan) | 53.2 ms | 12.8 ms | 4.1x |
+| cold open | 107 ms | 102 ms | unchanged (#37) |
+| heap after load | 68 MB | 73 MB | +7% |
+
+At 1.05M records, fixed tree vs the baseline table above (M3 numbers;
+this machine is an M1, so treat cross-machine rows as approximate):
+
+| 1.05M records | baseline | fixed | |
+|---|---|---|---|
+| bulk load | 9.8k rec/s (1 m 48 s) | 73.9k rec/s (14.3 s) | 7.5x |
+| `GET Users[id=N]` | 308 ms | 2 µs | |
+| single `CREATE` | 63 ms | 25 µs p50 (318 µs p99) | |
+| `UPDATE [id=N]` | 325 ms | 19 µs | |
+| delete 211-record subtree | 1.5 s | 1.0 ms | 1,500x |
+| subtree walk | 678 µs | 36 µs | 19x |
+| `GET Users[email=X]` (unindexed scan) | 307 ms | 60.9 ms | 5x |
+| cold open | 483 ms | 653 ms | still O(file size) (#37) |
+
+This meets the #33 target (`[id=N]` under 50 µs at 1M+) and the #34
+target direction (25 µs p50 single-record commits at 1M; the 50 µs
+@ 10M claim is untested). Still open from Phase 1 of #42: #4
+(cross-process file lock) and #41 (benchmark in CI). Next scaling
+steps: secondary/ordered indexes for attribute scans (#33 part 3),
+page-level lazy loading for open time and RAM (#37), and batched
+ingest (#39).
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
   with database size because each GET sorts the first layer (#33).
 - **Almost everything else scales with total DB size**, not with the
   work requested:
-  - each transaction copies every layer's index (#34)
-  - lookups never use the id index (#33)
+  - each transaction copies every layer's index (#34, fixed
+    2026-10-14: copy-on-write overlays, amortized O(1) per commit)
+  - lookups never use the id index (#33, fixed 2026-10-14: indexed
+    point lookups for id/slot/parent)
   - cascade delete rescans the index once per deleted record (#35,
     fixed 2026-10-14: O(subtree), see update above)
   - every CLI call rewrites the whole file (#32, fixed 2026-10-14: a

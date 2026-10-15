@@ -63,46 +63,204 @@ type Op struct {
 	ID     uint64  // for opDelete (root of the cascade)
 }
 
+// maxOverlayDepth bounds how many published copy-on-write layers may stack
+// before a commit flattens them into one root. Deeper chains make every
+// read walk more maps; shallower ones make flattening too frequent. Each
+// flatten copies the whole layer, so the amortized per-commit copy work is
+// O(layer size / maxOverlayDepth) instead of O(layer size) per commit.
+const maxOverlayDepth = 256
+
 // layerState is the physical state of one Y-axis layer: slotted pages keyed
 // by page index (slot / SlotsPerPage), the ID -> slot index, and the next
 // contiguous X slot to allocate.
+//
+// States are layered copy-on-write overlays. A transaction's state points
+// at the published state it started from (base) and records only what it
+// changed: pages touched, ids added, ids deleted. Published states are
+// immutable, so Begin is O(1) regardless of database size (issue #34) and
+// older snapshots keep seeing their own state. Commit publishes the overlay
+// as-is while it is shallow and sparse, and flattens it into a root
+// otherwise; because flattening starts once the accumulated deltas rival
+// the base, the total copy work over a stream of commits stays amortized
+// O(1) per commit.
 type layerState struct {
-	pages    map[uint64]*Page
-	idIndex  map[uint64]uint64
+	base     *layerState       // shared immutable parent (nil for a root)
+	pages    map[uint64]*Page  // pages created/modified relative to base
+	idIndex  map[uint64]uint64 // ids added relative to base
+	dels     map[uint64]bool   // ids deleted relative to base (tombstones)
 	nextSlot uint64
+	count    int // live records, maintained across the overlay chain
 }
 
 func newLayerState() *layerState {
 	return &layerState{pages: map[uint64]*Page{}, idIndex: map[uint64]uint64{}}
 }
 
-// clone copies the maps but shares the immutable pages (copy-on-write: a
-// writer clones a page before its first mutation).
-func (l *layerState) clone() *layerState {
-	c := &layerState{
-		pages:    make(map[uint64]*Page, len(l.pages)),
-		idIndex:  make(map[uint64]uint64, len(l.idIndex)),
-		nextSlot: l.nextSlot,
+// overlay returns a writable, initially empty copy-on-write layer on top of
+// l. O(1): the base state is shared, not copied.
+func (l *layerState) overlay() *layerState {
+	if l == nil {
+		return newLayerState()
 	}
-	for k, v := range l.pages {
+	return &layerState{
+		base:     l,
+		pages:    map[uint64]*Page{},
+		idIndex:  map[uint64]uint64{},
+		nextSlot: l.nextSlot,
+		count:    l.count,
+	}
+}
+
+// page returns the page with the given index, consulting the overlay chain
+// top-down (the most recent entry wins).
+func (l *layerState) page(idx uint64) *Page {
+	for ; l != nil; l = l.base {
+		if p := l.pages[idx]; p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+// slotOf resolves an id to its slot through the overlay chain.
+func (l *layerState) slotOf(id uint64) (uint64, bool) {
+	for ; l != nil; l = l.base {
+		if x, ok := l.idIndex[id]; ok {
+			return x, true
+		}
+		if l.dels[id] {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+func (l *layerState) record(id uint64) *Record {
+	x, ok := l.slotOf(id)
+	if !ok {
+		return nil
+	}
+	p := l.page(x / SlotsPerPage)
+	if p == nil {
+		return nil
+	}
+	return p.Get(x)
+}
+
+// dropID removes an id from the index. An overlay records a tombstone so
+// base entries are shadowed; a root drops the entry directly.
+func (l *layerState) dropID(id uint64) {
+	if _, ok := l.slotOf(id); !ok {
+		return
+	}
+	l.count--
+	delete(l.idIndex, id)
+	if l.base == nil {
+		return
+	}
+	if l.dels == nil {
+		l.dels = map[uint64]bool{}
+	}
+	l.dels[id] = true
+}
+
+// allPages merges the overlay chain into one index -> page map (topmost
+// entry wins). The result must be treated as read-only.
+func (l *layerState) allPages() map[uint64]*Page {
+	if l == nil {
+		return nil
+	}
+	out := map[uint64]*Page{}
+	if l.base != nil {
+		out = l.base.allPages()
+	}
+	for idx, p := range l.pages {
+		out[idx] = p
+	}
+	return out
+}
+
+// materialize flattens the overlay chain into a self-contained root state;
+// a root is returned unchanged. The root's maps are copied exactly once
+// and each level's deltas applied on top (a recursive copy per level would
+// cost O(depth x size)).
+func (l *layerState) materialize() *layerState {
+	if l == nil || l.base == nil {
+		return l
+	}
+	// chain[0] is the leaf, the last entry the root.
+	var chain []*layerState
+	for cur := l; cur != nil; cur = cur.base {
+		chain = append(chain, cur)
+	}
+	root := chain[len(chain)-1]
+	c := &layerState{
+		pages:    make(map[uint64]*Page, len(root.pages)+len(l.pages)),
+		idIndex:  make(map[uint64]uint64, len(root.idIndex)+len(l.idIndex)),
+		nextSlot: l.nextSlot,
+		count:    l.count,
+	}
+	for k, v := range root.pages {
 		c.pages[k] = v
 	}
-	for k, v := range l.idIndex {
+	for k, v := range root.idIndex {
+		c.idIndex[k] = v
+	}
+	for i := len(chain) - 2; i >= 0; i-- {
+		lvl := chain[i]
+		for k, v := range lvl.pages {
+			c.pages[k] = v
+		}
+		for k, v := range lvl.idIndex {
+			c.idIndex[k] = v
+		}
+		for id := range lvl.dels {
+			delete(c.idIndex, id)
+		}
+	}
+	return c
+}
+
+// copyRoot returns a deep copy of a materialized state whose pages may keep
+// being mutated in place by an unpublished view (journal replay forks).
+func (l *layerState) copyRoot() *layerState {
+	m := l.materialize()
+	c := &layerState{
+		pages:    make(map[uint64]*Page, len(m.pages)),
+		idIndex:  make(map[uint64]uint64, len(m.idIndex)),
+		nextSlot: m.nextSlot,
+		count:    m.count,
+	}
+	for k, v := range m.pages {
+		c.pages[k] = v
+	}
+	for k, v := range m.idIndex {
 		c.idIndex[k] = v
 	}
 	return c
 }
 
-func (l *layerState) record(id uint64) *Record {
-	x, ok := l.idIndex[id]
-	if !ok {
-		return nil
+// depth counts the layers stacked on top of a nil base.
+func (l *layerState) depth() int {
+	n := 0
+	for ; l != nil; l = l.base {
+		n++
 	}
-	p := l.pages[x/SlotsPerPage]
-	if p == nil {
-		return nil
+	return n
+}
+
+// settled returns the state to publish for this overlay: the overlay while
+// it is shallow and sparse, otherwise a flattened root. Flattening once
+// the accumulated deltas rival the base keeps the copy work amortized O(1)
+// per commit (sizes double, so copies form a geometric series).
+func (l *layerState) settled() *layerState {
+	if l.base == nil {
+		return l
 	}
-	return p.Get(x)
+	if l.depth() >= maxOverlayDepth || 4*(len(l.idIndex)+len(l.dels)) >= l.count {
+		return l.materialize()
+	}
+	return l
 }
 
 // matrixView is a read-only hierarchical matrix over the layer states of one
@@ -151,7 +309,7 @@ func (mv *matrixView) RecordBySlot(layer int, x uint64) (*Record, bool) {
 	if ls == nil {
 		return nil, false
 	}
-	p := ls.pages[x/SlotsPerPage]
+	p := ls.page(x / SlotsPerPage)
 	if p == nil {
 		return nil, false
 	}
@@ -159,19 +317,24 @@ func (mv *matrixView) RecordBySlot(layer int, x uint64) (*Record, bool) {
 	return r, r != nil
 }
 
-// Records returns all live records of a layer in slot order.
+// Records returns all live records of a layer in slot order. Pages are
+// already slot-ordered, so this walks them directly instead of collecting
+// and sorting every record (issue #33).
 func (mv *matrixView) Records(layer int) []*Record {
 	ls := mv.layers[layer]
 	if ls == nil {
 		return nil
 	}
-	out := make([]*Record, 0, len(ls.idIndex))
-	for id := range ls.idIndex {
-		if r := ls.record(id); r != nil {
-			out = append(out, r)
-		}
+	pages := ls.allPages()
+	idxs := make([]uint64, 0, len(pages))
+	for idx := range pages {
+		idxs = append(idxs, idx)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
+	sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
+	var out []*Record
+	for _, idx := range idxs {
+		out = append(out, pages[idx].Slots()...)
+	}
 	return out
 }
 
@@ -210,7 +373,7 @@ func (mv *matrixView) Children(layer int, id uint64) []*Record {
 // Count returns the number of live records in a layer.
 func (mv *matrixView) Count(layer int) int {
 	if ls := mv.layers[layer]; ls != nil {
-		return len(ls.idIndex)
+		return ls.count
 	}
 	return 0
 }
@@ -239,38 +402,43 @@ func (e *editView) markCloned(layer int, idx uint64) {
 	m[idx] = true
 }
 
+// layer returns the (possibly newly created) state for a height. In a
+// write transaction this is the transaction's own overlay.
+func (e *editView) layer(h int) *layerState {
+	ls := e.layers[h]
+	if ls == nil {
+		ls = newLayerState()
+		e.layers[h] = ls
+	}
+	return ls
+}
+
 // pageForWrite returns the page owning slot idx's page window, cloning it
 // first when it is still shared with an older snapshot.
 func (e *editView) pageForWrite(layer int, idx uint64) *Page {
-	ls := e.layers[layer]
-	if ls == nil {
-		ls = newLayerState()
-		e.layers[layer] = ls
+	ls := e.layer(layer)
+	if e.cloned[layer][idx] {
+		return ls.pages[idx]
 	}
-	p := ls.pages[idx]
-	if p == nil {
+	var p *Page
+	if base := ls.page(idx); base != nil {
+		p = base.Clone()
+	} else {
 		p = NewPage(layer, idx*SlotsPerPage)
-		ls.pages[idx] = p
-		e.markCloned(layer, idx)
-		return p
 	}
-	if !e.cloned[layer][idx] {
-		p = p.Clone()
-		ls.pages[idx] = p
-		e.markCloned(layer, idx)
-	}
+	ls.pages[idx] = p
+	e.markCloned(layer, idx)
 	return p
 }
 
 // put installs a record at its own slot and indexes it by ID.
 func (e *editView) put(layer int, rec *Record) {
-	ls := e.layers[layer]
-	if ls == nil {
-		ls = newLayerState()
-		e.layers[layer] = ls
-	}
+	ls := e.layer(layer)
 	p := e.pageForWrite(layer, rec.Slot/SlotsPerPage)
 	_ = p.Put(rec)
+	if _, ok := ls.slotOf(rec.ID); !ok {
+		ls.count++
+	}
 	ls.idIndex[rec.ID] = rec.Slot
 	if rec.Slot >= ls.nextSlot {
 		ls.nextSlot = rec.Slot + 1
@@ -283,13 +451,13 @@ func (e *editView) remove(layer int, id uint64) bool {
 	if ls == nil {
 		return false
 	}
-	x, ok := ls.idIndex[id]
+	x, ok := ls.slotOf(id)
 	if !ok {
 		return false
 	}
 	p := e.pageForWrite(layer, x/SlotsPerPage)
 	p.Invalidate(x)
-	delete(ls.idIndex, id)
+	ls.dropID(id)
 	return true
 }
 
@@ -610,10 +778,12 @@ func Open(path string) (*DB, error) {
 			srcName, srcCommit := splitFork(ev.Fork)
 			srcView := ensureState(srcName)
 			if _, ok := forks[ev.Name]; !ok && ev.Name != DefaultBranch {
-				// Fork the source state as of its current replayed state.
+				// Fork the source state as of its current replayed
+				// state. The source view keeps mutating its state
+				// in place, so the fork needs a real deep copy.
 				cloned := make(map[int]*layerState, len(srcView.layers))
 				for h, ls := range srcView.layers {
-					cloned[h] = ls.clone()
+					cloned[h] = ls.copyRoot()
 				}
 				views[ev.Name] = newEditView(hdr, cloned)
 				states[ev.Name] = cloned
@@ -731,6 +901,7 @@ func loadPageBlocks(data []byte) (map[string]map[int]*layerState, uint64, error)
 			if rec.ID > maxID {
 				maxID = rec.ID
 			}
+			ls.count++
 		}
 	}
 	return states, maxID, nil
@@ -801,9 +972,12 @@ func (db *DB) Begin(branch string, meta TxMeta) (*WriteTx, error) {
 	if err != nil {
 		return nil, err
 	}
+	// O(1) regardless of database size: the transaction gets an empty
+	// copy-on-write overlay per layer, sharing the published state as its
+	// base (issue #34).
 	layers := make(map[int]*layerState, len(base.layers))
 	for h, ls := range base.layers {
-		layers[h] = ls.clone()
+		layers[h] = ls.overlay()
 	}
 	return &WriteTx{
 		db:     db,
@@ -854,11 +1028,7 @@ func (tx *WriteTx) Create(layerName string, parentID uint64, attrs []string) (*R
 		_ = parent
 	}
 
-	ls := tx.view.layers[height]
-	if ls == nil {
-		ls = newLayerState()
-		tx.view.layers[height] = ls
-	}
+	ls := tx.view.layer(height)
 	rec := &Record{
 		ID:     tx.db.seq.Add(1),
 		Slot:   ls.nextSlot,
@@ -985,6 +1155,14 @@ func (tx *WriteTx) Commit() (*Snapshot, error) {
 		return nil, err
 	}
 
+	// Publish the transaction's overlays while they are shallow and
+	// sparse; flatten them into a root once they are deep or dense so the
+	// copy work stays amortized O(1) per commit and reads walk a bounded
+	// chain.
+	for h, ls := range tx.view.layers {
+		tx.view.layers[h] = ls.settled()
+	}
+
 	snap := &Snapshot{
 		Branch:     tx.branch,
 		Commit:     c.ID,
@@ -1084,13 +1262,14 @@ func (db *DB) checkpointLocked() error {
 			if ls == nil {
 				continue
 			}
-			idxs := make([]uint64, 0, len(ls.pages))
-			for idx := range ls.pages {
+			pages := ls.allPages()
+			idxs := make([]uint64, 0, len(pages))
+			for idx := range pages {
 				idxs = append(idxs, idx)
 			}
 			sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
 			for _, idx := range idxs {
-				pageBytes, err := ls.pages[idx].MarshalBinary()
+				pageBytes, err := pages[idx].MarshalBinary()
 				if err != nil {
 					return err
 				}
