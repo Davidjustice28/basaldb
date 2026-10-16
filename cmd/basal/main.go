@@ -170,7 +170,7 @@ func cmdInspect(args []string) error {
 	branch := fs.String("branch", "", "branch to inspect (default: 'basal config set branch', else main)")
 	header := fs.Bool("header", false, "print the raw ASCII header block")
 	asJSON := fs.Bool("json", false, "print JSON")
-	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). Does not cap the id index")
+	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). The id index is mapped; secondary indexes stay resident")
 	_ = fs.Parse(args)
 	path, err := config.ResolveFile(*file)
 	if err != nil {
@@ -330,7 +330,7 @@ func cmdQuery(args []string) error {
 	reason := fs.String("reason", "", "stamps the commit block (required for BRANCH CREATE)")
 	format := fs.String("format", "table", "output format: table, csv, tsv or json (-json is an alias for -format json)")
 	asJSON := fs.Bool("json", false, "print JSON (alias for -format json)")
-	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). Does not cap the id index")
+	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). The id index is mapped; secondary indexes stay resident")
 	flagArgs, posArgs := splitArgs(args, map[string]bool{"json": true})
 	_ = fs.Parse(flagArgs)
 	if len(posArgs) != 1 {

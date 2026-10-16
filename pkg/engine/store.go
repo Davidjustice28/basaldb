@@ -24,6 +24,7 @@ var (
 	ErrConflict    = errors.New("engine: concurrent write conflict")
 	ErrTxDone      = errors.New("engine: transaction already finished")
 	ErrBranchTaken = errors.New("engine: branch already exists")
+	ErrLocked      = errors.New("engine: database is locked")
 )
 
 // TxMeta carries the audit metadata recorded with every commit and
@@ -92,6 +93,7 @@ type layerState struct {
 	dels     map[uint64]bool       // ids deleted relative to base (tombstones)
 	indexes  map[string]*attrIndex // attr name -> COW hash index tip at this level
 	disk     *diskLayer            // immutable page directory (roots only)
+	idDisk   *idDisk               // sorted id→slot pairs mapped from the file (roots only)
 	nextSlot uint64
 	count    int // live records, maintained across the overlay chain
 }
@@ -313,7 +315,8 @@ func (l *layerState) loadErr() error {
 	return nil
 }
 
-// slotOf resolves an id to its slot through the overlay chain.
+// slotOf resolves an id to its slot through the overlay chain. A disk id
+// table is binary-searched and is not copied into the overlay map.
 func (l *layerState) slotOf(id uint64) (uint64, bool) {
 	for ; l != nil; l = l.base {
 		if x, ok := l.idIndex[id]; ok {
@@ -321,6 +324,11 @@ func (l *layerState) slotOf(id uint64) (uint64, bool) {
 		}
 		if l.dels[id] {
 			return 0, false
+		}
+		if l.idDisk != nil {
+			if x, ok := l.idDisk.find(id); ok {
+				return x, true
+			}
 		}
 	}
 	return 0, false
@@ -369,6 +377,9 @@ func (l *layerState) materialize() *layerState {
 		chain = append(chain, cur)
 	}
 	root := chain[len(chain)-1]
+	if root.idDisk != nil {
+		return l.materializeOverDisk(chain, root)
+	}
 	c := &layerState{
 		pages:    make(map[uint64]*Page, len(root.pages)+len(l.pages)),
 		idIndex:  make(map[uint64]uint64, len(root.idIndex)+len(l.idIndex)),
@@ -398,6 +409,45 @@ func (l *layerState) materialize() *layerState {
 	return c
 }
 
+// materializeOverDisk collapses memory deltas into one overlay that still
+// points at the mapped id table. It does not load that table into a map.
+func (l *layerState) materializeOverDisk(chain []*layerState, root *layerState) *layerState {
+	c := &layerState{
+		base:     root,
+		pages:    make(map[uint64]*Page, len(root.pages)+len(l.pages)),
+		idIndex:  make(map[uint64]uint64, len(root.idIndex)+len(l.idIndex)),
+		indexes:  flattenIndexMap(l),
+		nextSlot: l.nextSlot,
+		count:    l.count,
+	}
+	for k, v := range root.pages {
+		c.pages[k] = v
+	}
+	for k, v := range root.idIndex {
+		c.idIndex[k] = v
+	}
+	for i := len(chain) - 2; i >= 0; i-- {
+		lvl := chain[i]
+		for k, v := range lvl.pages {
+			c.pages[k] = v
+		}
+		for k, v := range lvl.idIndex {
+			c.idIndex[k] = v
+			if c.dels != nil {
+				delete(c.dels, k)
+			}
+		}
+		for id := range lvl.dels {
+			delete(c.idIndex, id)
+			if c.dels == nil {
+				c.dels = map[uint64]bool{}
+			}
+			c.dels[id] = true
+		}
+	}
+	return c
+}
+
 // flattenIndexMap copies every live secondary index into a root node.
 func flattenIndexMap(l *layerState) map[string]*attrIndex {
 	names := map[string]struct{}{}
@@ -420,18 +470,33 @@ func flattenIndexMap(l *layerState) map[string]*attrIndex {
 func (l *layerState) copyRoot() *layerState {
 	m := l.materialize()
 	c := &layerState{
+		base:     m.base,
 		pages:    make(map[uint64]*Page, len(m.pages)),
 		idIndex:  make(map[uint64]uint64, len(m.idIndex)),
 		indexes:  flattenIndexMap(m),
 		disk:     m.disk,
+		idDisk:   m.idDisk,
 		nextSlot: m.nextSlot,
 		count:    m.count,
+	}
+	// The disk id table and page directory stay on the shared root. The
+	// copy holds only the in-memory deltas so later replay cannot mutate
+	// the fork through the source.
+	if m.base != nil {
+		c.disk = nil
+		c.idDisk = nil
 	}
 	for k, v := range m.pages {
 		c.pages[k] = v
 	}
 	for k, v := range m.idIndex {
 		c.idIndex[k] = v
+	}
+	if len(m.dels) > 0 {
+		c.dels = make(map[uint64]bool, len(m.dels))
+		for k, v := range m.dels {
+			c.dels[k] = v
+		}
 	}
 	return c
 }
@@ -842,6 +907,8 @@ type DB struct {
 	forks      map[string]string // branch -> "source@commit"
 	events     []LogEntry        // chronological audit trail
 	closed     bool
+
+	release func() // drops the cross-process file lock
 }
 
 // Path returns the .bsl file path.
@@ -859,8 +926,16 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 	if err := validateLayers(layers); err != nil {
 		return nil, err
 	}
+	release, err := lockPath(path+".lock", DefaultLockTimeout)
+	if err != nil {
+		return nil, err
+	}
+	failLock := func(err error) (*DB, error) {
+		release()
+		return nil, err
+	}
 	if _, err := os.Stat(path); err == nil {
-		return nil, fmt.Errorf("engine: %s already exists", path)
+		return failLock(fmt.Errorf("engine: %s already exists", path))
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
@@ -869,6 +944,7 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 	fail := func(err error) (*DB, error) {
 		f.Close()
 		os.Remove(path)
+		release()
 		return nil, err
 	}
 
@@ -941,6 +1017,7 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 		forks:         map[string]string{DefaultBranch: ""},
 		events:        []LogEntry{{Commit: c}},
 		nextCommit:    2,
+		release:       release,
 	}
 	db.state.Store(&dbState{branches: map[string]*Snapshot{DefaultBranch: snap}})
 	return db, nil
@@ -969,9 +1046,30 @@ func validateLayers(layers []Layer) error {
 }
 
 // Open opens (and recovers) an existing .bsl database: it parses the ASCII
-// header, loads the commit log region and slotted data pages, then replays
-// the delta journal so readers see a consistent recovered state.
+// header, loads the commit log and the page directory, then replays the
+// delta journal. Id pairs stay in a mapped index and are not copied into a
+// resident map. Another process that already holds the file is waited on
+// for DefaultLockTimeout; past that, Open returns ErrLocked.
 func Open(path string) (*DB, error) {
+	return OpenTimeout(path, DefaultLockTimeout)
+}
+
+// OpenTimeout is Open with an explicit wait for the cross-process lock.
+func OpenTimeout(path string, wait time.Duration) (*DB, error) {
+	release, err := lockPath(path+".lock", wait)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openUnlocked(path)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	db.release = release
+	return db, nil
+}
+
+func openUnlocked(path string) (*DB, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -1018,29 +1116,32 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	gen := &fileGen{f: f, wide: hdr.Version != VersionV10, cache: newPageCache(DefaultCacheBytes)}
+	if err := gen.mapFile(size); err != nil {
+		f.Close()
+		return nil, err
+	}
 	var states map[string]map[int]*layerState
 	var maxID uint64
 	if hdr.IndexEnd > hdr.IndexStart {
-		indexBytes, err := readRegion(f, hdr.IndexStart, hdr.IndexEnd)
-		if err != nil {
-			f.Close()
-			return nil, err
+		if gen.mapped == nil || hdr.IndexEnd > uint64(len(gen.mapped)) {
+			gen.close()
+			return nil, fmt.Errorf("%w: index region past EOF", ErrCorruptHeader)
 		}
-		states, maxID, err = decodeIndex(indexBytes, gen)
+		states, maxID, err = decodeIndex(gen.mapped[hdr.IndexStart:hdr.IndexEnd], gen)
 		if err != nil {
-			f.Close()
+			gen.close()
 			return nil, err
 		}
 	} else {
 		states, maxID, err = scanDataPages(f, hdr, gen)
 		if err != nil {
-			f.Close()
+			gen.close()
 			return nil, err
 		}
 	}
 	jrecs, err := parseJournal(journalBytes)
 	if err != nil {
-		f.Close()
+		gen.close()
 		return nil, err
 	}
 
@@ -1070,7 +1171,7 @@ func Open(path string) (*DB, error) {
 		if e.Commit != nil {
 			c := e.Commit
 			if _, dup := commits[c.ID]; dup {
-				f.Close()
+				gen.close()
 				return nil, fmt.Errorf("engine: duplicate commit %d in log region", c.ID)
 			}
 			commits[c.ID] = c
@@ -1079,7 +1180,7 @@ func Open(path string) (*DB, error) {
 		} else if e.Branch != nil {
 			ev := e.Branch
 			if _, dup := forks[ev.Name]; dup && ev.Name != DefaultBranch {
-				f.Close()
+				gen.close()
 				return nil, fmt.Errorf("engine: duplicate branch %q in log region", ev.Name)
 			}
 			forks[ev.Name] = ev.Fork
@@ -1115,14 +1216,14 @@ func Open(path string) (*DB, error) {
 		}
 		c := jr.commit
 		if _, dup := commits[c.ID]; dup {
-			f.Close()
+			gen.close()
 			return nil, fmt.Errorf("engine: duplicate commit %d in journal", c.ID)
 		}
 		commits[c.ID] = c
 		view := ensureState(c.Branch)
 		for _, op := range jr.ops {
 			if err := applyOp(view, op); err != nil {
-				f.Close()
+				gen.close()
 				return nil, err
 			}
 		}
@@ -1625,6 +1726,14 @@ func (db *DB) checkpointLocked() error {
 	}
 	off := uint64(HeaderBlockSize + len(logBytes))
 	metas := map[string]map[int]*layerMeta{}
+	// Unchanged pages are shared across branches. The key is the in-memory
+	// page pointer (copy-on-write) or the source file offset (already on disk).
+	type shareKey struct {
+		page *Page
+		gen  *fileGen
+		off  uint64
+	}
+	written := map[shareKey]pageLoc{}
 	var blockLen [4]byte
 	var nameLen [2]byte
 	for _, branch := range branchNames {
@@ -1641,22 +1750,39 @@ func (db *DB) checkpointLocked() error {
 			idxs := ls.pageIndexes()
 			sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
 			for _, idx := range idxs {
-				p := ls.page(idx)
-				if p == nil {
+				p, srcGen, srcLoc, ok := pageSource(ls, idx)
+				if !ok {
 					if err := ls.loadErr(); err != nil {
 						return fail(err)
 					}
 					return fail(fmt.Errorf("engine: missing page %d while checkpointing %s", idx, branch))
 				}
-				pageBytes, err := p.MarshalBinary()
-				if err != nil {
-					return fail(err)
+				key := shareKey{page: p, gen: srcGen, off: srcLoc.off}
+				if prev, ok := written[key]; ok {
+					lm.refs[idx] = prev
+					continue
 				}
-				payload := make([]byte, 0, 2+len(branch)+len(pageBytes))
-				binary.LittleEndian.PutUint16(nameLen[:], uint16(len(branch)))
-				payload = append(payload, nameLen[:]...)
-				payload = append(payload, branch...)
-				payload = append(payload, pageBytes...)
+				var payload []byte
+				if p != nil {
+					pageBytes, err := p.MarshalBinary()
+					if err != nil {
+						return fail(err)
+					}
+					payload = make([]byte, 0, 2+len(branch)+len(pageBytes))
+					binary.LittleEndian.PutUint16(nameLen[:], uint16(len(branch)))
+					payload = append(payload, nameLen[:]...)
+					payload = append(payload, branch...)
+					payload = append(payload, pageBytes...)
+				} else {
+					raw := make([]byte, srcLoc.n)
+					if srcGen == nil || srcGen.f == nil {
+						return fail(fmt.Errorf("engine: page %d has no source file", idx))
+					}
+					if _, err := srcGen.f.ReadAt(raw, int64(srcLoc.off)+4); err != nil {
+						return fail(err)
+					}
+					payload = raw
+				}
 				if len(payload) > int(^uint32(0)) {
 					return fail(fmt.Errorf("engine: page block exceeds uint32"))
 				}
@@ -1667,7 +1793,9 @@ func (db *DB) checkpointLocked() error {
 				if _, err := tf.Write(payload); err != nil {
 					return fail(err)
 				}
-				lm.refs[idx] = pageLoc{off: off, n: uint32(len(payload))}
+				loc := pageLoc{off: off, n: uint32(len(payload))}
+				lm.refs[idx] = loc
+				written[key] = loc
 				off += 4 + uint64(len(payload))
 			}
 			if metas[branch] == nil {
@@ -1677,14 +1805,11 @@ func (db *DB) checkpointLocked() error {
 		}
 	}
 	dataEnd := off
-	indexBytes, err := encodeIndex(branchNames, metas)
+	indexN, err := writeIndex(tf, branchNames, metas)
 	if err != nil {
 		return fail(err)
 	}
-	if _, err := tf.Write(indexBytes); err != nil {
-		return fail(err)
-	}
-	indexEnd := dataEnd + uint64(len(indexBytes))
+	indexEnd := dataEnd + uint64(indexN)
 
 	hdr := *db.hdr
 	// A checkpoint rewrites every tuple in the wide layout, so the file
@@ -1727,6 +1852,15 @@ func (db *DB) checkpointLocked() error {
 		db.cache = newPageCache(DefaultCacheBytes)
 		newGen.cache = db.cache
 	}
+	stSize, err := nf.Stat()
+	if err != nil {
+		nf.Close()
+		return err
+	}
+	if err := newGen.mapFile(stSize.Size()); err != nil {
+		nf.Close()
+		return err
+	}
 	if oldGen != nil {
 		db.cache.dropGen(oldGen)
 		// The previous inode stays readable for snapshots that still point
@@ -1741,25 +1875,27 @@ func (db *DB) checkpointLocked() error {
 	db.hdr = &hdr
 	db.journalOff = hdr.JournalStart
 
+	var states map[string]map[int]*layerState
+	if hdr.IndexEnd > hdr.IndexStart {
+		if newGen.mapped == nil || hdr.IndexEnd > uint64(len(newGen.mapped)) {
+			return fmt.Errorf("%w: index region past EOF after checkpoint", ErrCorruptHeader)
+		}
+		states, _, err = decodeIndex(newGen.mapped[hdr.IndexStart:hdr.IndexEnd], newGen)
+		if err != nil {
+			return err
+		}
+	} else {
+		states = map[string]map[int]*layerState{}
+	}
 	next := make(map[string]*Snapshot, len(st.branches))
 	for _, branch := range branchNames {
 		old := st.branches[branch]
 		if old == nil {
 			continue
 		}
-		layers := make(map[int]*layerState, len(metas[branch]))
-		for height, lm := range metas[branch] {
-			ls := newLayerState()
-			ls.nextSlot = lm.nextSlot
-			ls.count = lm.count
-			ls.idIndex = lm.idIndex
-			if lm.indexes != nil {
-				ls.indexes = lm.indexes
-			}
-			if len(lm.refs) > 0 {
-				ls.disk = &diskLayer{gen: newGen, branch: branch, layer: height, refs: lm.refs}
-			}
-			layers[height] = ls
+		layers := states[branch]
+		if layers == nil {
+			layers = map[int]*layerState{}
 		}
 		next[branch] = &Snapshot{
 			Branch:     branch,
@@ -1771,23 +1907,34 @@ func (db *DB) checkpointLocked() error {
 	return nil
 }
 
-// exportLayer copies the id index and flattens secondary indexes so the
-// published disk head does not share maps with the snapshot being checkpointed.
+// pageSource reports where a page's bytes live without decoding a disk page.
+// An in-memory page is returned as p. A disk page is returned as gen+loc.
+func pageSource(l *layerState, idx uint64) (*Page, *fileGen, pageLoc, bool) {
+	for cur := l; cur != nil; cur = cur.base {
+		if p := cur.pages[idx]; p != nil {
+			return p, nil, pageLoc{}, true
+		}
+	}
+	for cur := l; cur != nil; cur = cur.base {
+		if cur.disk == nil || cur.disk.gen == nil {
+			continue
+		}
+		if loc, ok := cur.disk.refs[idx]; ok {
+			return nil, cur.disk.gen, loc, true
+		}
+	}
+	return nil, nil, pageLoc{}, false
+}
+
+// exportLayer records the live layer so the index writer can stream ids.
+// It does not copy the id table into a map.
 func exportLayer(l *layerState, height int) *layerMeta {
-	m := l.materialize()
-	if m == nil {
-		m = l
-	}
-	idIndex := make(map[uint64]uint64, len(m.idIndex))
-	for k, v := range m.idIndex {
-		idIndex[k] = v
-	}
 	return &layerMeta{
 		height:   height,
-		nextSlot: m.nextSlot,
-		count:    m.count,
+		nextSlot: l.nextSlot,
+		count:    l.count,
 		refs:     map[uint64]pageLoc{},
-		idIndex:  idIndex,
+		src:      l,
 		indexes:  flattenIndexMap(l),
 	}
 }
@@ -1800,6 +1947,30 @@ func cloneLayers(in map[int]Layer) map[int]Layer {
 		out[k] = v
 	}
 	return out
+}
+
+// abandon closes the file and the lock without checkpointing. Tests use it
+// to stand in for a crashed process, which drops its locks when it exits.
+func (db *DB) abandon() error {
+	db.mu.Lock()
+	db.closed = true
+	db.mu.Unlock()
+	var err error
+	if db.gen != nil {
+		db.gen.unmap()
+		if db.gen.f == db.f {
+			db.gen.f = nil
+		}
+	}
+	if db.f != nil {
+		err = db.f.Close()
+		db.f = nil
+	}
+	if db.release != nil {
+		db.release()
+		db.release = nil
+	}
+	return err
 }
 
 // Close checkpoints the database (only if the journal holds records since
@@ -1822,17 +1993,27 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	db.closed = true
 	db.mu.Unlock()
-	if db.gen != nil && db.gen.f == db.f {
-		db.gen.f = nil
+	if db.gen != nil {
+		db.gen.unmap()
+		if db.gen.f == db.f {
+			db.gen.f = nil
+		}
 	}
-	if cerr := db.f.Close(); err == nil {
-		err = cerr
+	if db.f != nil {
+		if cerr := db.f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if db.release != nil {
+		db.release()
+		db.release = nil
 	}
 	return err
 }
 
-// SetCacheLimit caps decoded slotted pages. The id index and secondary
-// indexes stay resident. n <= 0 restores the default budget.
+// SetCacheLimit caps decoded slotted pages. Secondary attribute indexes
+// stay resident. The id index is mapped from the file and is not part of
+// this budget. n <= 0 restores the default budget.
 func (db *DB) SetCacheLimit(n int) {
 	if db.cache == nil {
 		db.cache = newPageCache(n)

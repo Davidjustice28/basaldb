@@ -461,8 +461,8 @@ equality hash index to an existing attribute and checkpoints. `timestamp`
 is in Unix seconds.
 
 `basal query` and `basal inspect` take `-max-memory 256MB` (also `basald`)
-to cap the decoded page cache. The default is 64MB. The id index is not
-part of that cap.
+to cap the decoded page cache. The default is 64MB. The id index is a
+mapped array and is outside that cap. Secondary indexes stay resident.
 
 ### BRANCH statements
 
@@ -659,8 +659,7 @@ $ curl 'localhost:8080/v1/commits?branch=main'
 [{"kind":"commit","id":13,"branch":"main","author":"Alex <alex@acme.io>", … ,"ops":["UPDATE Users#0 id=6"]}, …]
 ```
 
-Errors come back as `{"error":"…"}` with status `400` / `401` / `403` / `405` / `409` / `413`. Don't run
-CLI writes against a file while `basald` is serving it
+Errors come back as `{"error":"…"}` with status `400` / `401` / `403` / `405` / `409` / `413`. `basald` holds the file lock, so a CLI open of the same file waits 30 seconds and then exits with `database is locked`
 ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 
 ---
@@ -669,12 +668,12 @@ CLI writes against a file while `basald` is serving it
 
 Current gaps, with tracking issues:
 
-- **Concurrency:** only one writing process per file (#4)
+- **Concurrency:** one process holds `file.bsl.lock`; a second waits 30s, then fails with `database is locked` (#4)
 - **Statements:** one per call, no transactions (#22, #1)
 - **Filters:** AND only, no OR/IN/LIKE (#9, #10)
 - **Sort/paging:** id only, no offset (#11); no COUNT (#12)
 - **Paths:** downward only, no skipping layers, leaf columns only (#13, #14, #3)
 - **Records:** can't change parent (#15); orphans possible (#5)
-- **Schema:** strings only, fixed at init except `CREATE INDEX` (#16, #17, #29, #30, #18). `-max-memory` (query, inspect, basald) caps the page cache, not the id index.
+- **Schema:** strings only, fixed at init except `CREATE INDEX` (#16, #17, #29, #30, #18). `-max-memory` (query, inspect, basald) caps the page cache. The id index is mapped. Secondary indexes stay resident.
 - **Branches:** no delete/diff/merge (#19, #20); no time travel (#21)
 - **Tooling:** no export/import, verify, compact, version, CSV (#24, #25, #26, #27, #28), no interactive shell (#23)

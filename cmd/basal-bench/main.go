@@ -65,7 +65,32 @@ func main() {
 	users := flag.Int("users", 20, "")
 	path := flag.String("file", "bench.bsl", "")
 	indexList := flag.String("index", "", "comma-separated attribute names to hash-index, e.g. email")
+	generateGB := flag.Float64("generate-gb", 0, "write a flat file of about this many GiB and exit")
+	openOnly := flag.Bool("open-only", false, "open -file, print open time and heap, look up one id, exit")
 	flag.Parse()
+	if *generateGB > 0 {
+		target := int64(*generateGB * float64(1<<30))
+		t0 := time.Now()
+		n, err := engine.GenerateFlat(*path, target)
+		must(err)
+		fmt.Printf("[gen] %d records, %.2f GB file, in %v\n", n, float64(fsize(*path))/1e9, time.Since(t0).Round(time.Millisecond))
+		return
+	}
+	if *openOnly {
+		t0 := time.Now()
+		db, err := engine.Open(*path)
+		must(err)
+		fmt.Printf("[open] cold open: %v\n", time.Since(t0).Round(time.Millisecond))
+		fmt.Printf("[mem]  heap after open: %.0f MB\n", heapMB())
+		ctx := &bql.ExecContext{DB: db, Branch: "main"}
+		s := time.Now()
+		if _, err := bql.Exec(ctx, `GET Users[id=1]`); err != nil {
+			must(err)
+		}
+		fmt.Printf("[read] GET Users[id=1]: %v\n", time.Since(s).Round(time.Microsecond))
+		must(db.Close())
+		return
+	}
 	if *accts**teams < 300 {
 		fmt.Fprintln(os.Stderr, "basal-bench: need accounts*teams >= 300")
 		os.Exit(2)
@@ -136,6 +161,7 @@ func main() {
 	db, err = engine.Open(*path)
 	must(err)
 	fmt.Printf("[open] cold open (load whole file): %v\n", time.Since(t0).Round(time.Millisecond))
+	fmt.Printf("[mem]  heap after open: %.0f MB\n", heapMB())
 
 	ctx := &bql.ExecContext{DB: db, Branch: "main"}
 	q := func(s string) *bql.Result { r, err := bql.Exec(ctx, s); must(err); return r }

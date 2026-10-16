@@ -32,7 +32,7 @@ func main() {
 		insecure = flag.Bool("insecure-no-auth", false, "allow a non-loopback listen with no token")
 		tlsCert  = flag.String("tls-cert", "", "TLS certificate file; requires -tls-key")
 		tlsKey   = flag.String("tls-key", "", "TLS private key file; requires -tls-cert")
-		maxMem   = flag.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). Does not cap the id index")
+		maxMem   = flag.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). The id index is mapped; secondary indexes stay resident")
 	)
 	flag.Parse()
 

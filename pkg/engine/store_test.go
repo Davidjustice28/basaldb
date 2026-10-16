@@ -271,7 +271,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if _, err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db2.f.Close(); err != nil { // simulate a crash: skip checkpoint
+	if err := db2.abandon(); err != nil { // simulate a crash: skip checkpoint
 		t.Fatal(err)
 	}
 

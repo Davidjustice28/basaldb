@@ -254,6 +254,75 @@ from 106k to 7.8k records/s and made open and RAM worse, because that
 index stays resident next to the id index. A low-cardinality attribute
 was not measured.
 
+## Update: 2026-10-16 — file lock, shared pages, mapped id index
+
+Same machine (Apple M3 Pro, 12 cores, 18 GB), Go 1.27.2. This section
+is the measurement for the three limits named above. The latency tables
+earlier in this file stay the quiet-run record. A repeat of the full
+211k and 1.05M latency run on a busy machine was slower across the
+board, so those timings are not a new baseline. File sizes from that
+run are used here.
+
+### Cross-process writes
+
+`Open` and `Init` take an exclusive `flock` on `<file>.bsl.lock` and
+hold it until `Close`. The sidecar stays put across a checkpoint
+rename. The wait is 30 seconds. After that the error is
+`engine: database is locked` and the CLI exits non-zero. Query,
+inspect, branch, and `basald` all take this same exclusive lock, so
+two processes do not use one file together. `basald` holds it for the
+life of the server.
+
+### Branch page sharing
+
+A checkpoint writes an unchanged page once. Each branch still stores
+its own id pairs (16 bytes per live record) and any page that branch
+modified. Stock schema, no secondary index, one new branch and one
+update:
+
+| | file before | file after | earlier full page copy |
+|---|---|---|---|
+| 211k records | 32.6 MB | 36.1 MB | 55.6 MB |
+| 1.05M records | 166.0 MB | 183.1 MB | 283.2 MB |
+
+The 17 MB added at 1.05M is a second id table plus the modified page.
+
+### Opening a large file
+
+`basal-bench -generate-gb 10` streams one layer, `Users(name)`, with
+10 GiB of pages, 205,878,273 records, and an empty commit log. The
+generator finishes in 2 m 7 s at 30 MB RSS. The file is 14.04 GB.
+The index region is 3.30 GB. Open is a second process
+(`basal-bench -open-only`):
+
+| | first open | second open |
+|---|---|---|
+| Cold open | 12 ms | 5 ms |
+| Heap after open | 7 MB | 7 MB |
+| Max RSS (`/usr/bin/time -l`) | 18 MB | 17 MB |
+| Page faults | 264 | 0 |
+| `GET Users[id=1]` | 2.8 ms | 184 µs |
+
+RSS stays at 18 MB beside a 3.30 GB id index. The 264 faults are the
+page directory and the one data page the lookup touches.
+
+Files produced by the normal commit path still parse the whole commit
+log at open:
+
+| | 211k bench file | 1.05M bench file |
+|---|---|---|
+| Cold open | 16 ms | 84 ms |
+| Heap after open | 15 MB | 74 MB |
+| Max RSS | 47 MB | 150 MB |
+
+The 1.05M commit log is about 47 MB, and that parsed log is what the
+74 MB heap is. The id pairs in that file are mapped.
+
+A 10 GB checkpoint with an empty log meets the 50 ms open target.
+A long commit log still adds open time and RAM. A cold id lookup is
+still one data-page fault: 2.8 ms on the first touch of the 14 GB
+file, and about 250 µs at 1.05M in the quiet run above.
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
@@ -268,21 +337,23 @@ was not measured.
     fixed 2026-10-14: O(subtree), see update above)
   - every CLI call rewrites the whole file (#32, fixed 2026-10-14: a
     clean close no longer checkpoints)
-- **Memory and storage:** the 2026-10-16 table is the lazy-load
-  measurement. A checkpointed file opens from its index region (id
-  index and secondary indexes resident, page bodies cached up to
-  `-max-memory`, default 64MB). Cold open at 1.05M is 78 ms and still
-  grows with the id index. Each branch still adds a near-full copy of
-  its pages on disk (#36). Ingest peak RSS is still the in-memory load
-  that checkpoint later releases.
+- **Memory and storage:** the lazy-load table earlier on this page is
+  the run from before the mapped id index. Page bodies are cached up
+  to `-max-memory` (default 64MB). Secondary indexes stay resident.
+  Ingest peak RSS is still the in-memory load that checkpoint later
+  releases. After checkpoint, a 14 GB file with an empty commit log
+  opens in 12 ms at 18 MB RSS. A branch adds about 16 bytes per record
+  of id pairs, plus pages that branch changed.
 
-**Today:** a single writer, through `basald` or the Go packages, handles
-about 1M records with ~10 µs creates and indexed id lookups that fault
-one page (~240 µs when that page is not cached). An equality index on a
-hot page is 1 µs; the same lookup on a cold page is ~250 µs, and a
-unique index over 1M values cuts ingest to 7.8k records/s. Unindexed
-attribute scans still read the layer, and they re-read it when the file
-is larger than the page cache. See
+**Today:** one process holds the file lock. Through `basald` or the Go
+packages it handles about 1M records with ~10 µs creates and indexed id
+lookups that fault one page (~240 µs when that page is not cached, 2.8 ms
+on the first touch of a 14 GB file). An equality index on a hot page is
+1 µs; the same lookup on a cold page is ~250 µs, and a unique index over
+1M values cuts ingest to 7.8k records/s. Unindexed attribute scans still
+read the layer, and they re-read it when the file is larger than the
+page cache. A checkpointed 14 GB file opens in 12 ms. A long commit log
+is still parsed at open. See
 [#42](https://github.com/Davidjustice28/basaldb/issues/42) for the plan
-and targets (10M+ records, ≥100k records/s ingest, <50 µs indexed
-lookups, bounded RAM).
+and the remaining targets (10M+ records through normal ingest, ≥100k
+records/s, cold indexed lookups under 50 µs).

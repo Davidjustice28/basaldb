@@ -53,41 +53,52 @@ for full walkthroughs. BasalDB also works for any other data that nests
 > query language may still change. Don't use it for data you can't afford
 > to lose.
 >
-> **Where it stands** (2026-10-16, Apple M3 Pro, in-process, 1.05M
-> records; details in [BENCHMARKS.md](BENCHMARKS.md)):
+> **Where it stands** (2026-10-16, Apple M3 Pro; details in
+> [BENCHMARKS.md](BENCHMARKS.md)):
 >
-> - **Ingest** is about 106k records/s with no secondary index. A hash
->   index on a unique attribute (`email!`, one value per user) dropped
->   that to 7.8k records/s. Index attributes you look up and that repeat,
->   such as `status` or `role`. A unique index over a million values is
->   resident and expensive to build.
-> - **Open** of that unindexed file is 78 ms, and peak RSS during ingest
->   is 0.9 GB. With `email!` those become 315 ms and 2.0 GB. Page bodies
->   sit in a 64MB cache (`-max-memory`). The id index, and every
->   secondary index, stay in memory, so open time and RAM still grow
->   with the number of records.
+> - **Ingest** of the stock schema is about 106k records/s at 1.05M
+>   records. A hash index on a unique attribute (`email!`, one value per
+>   user) dropped that to 7.8k records/s. Index attributes you look up
+>   and that repeat, such as `status` or `role`. A unique index over a
+>   million values is resident and expensive to build.
+> - **Open.** A checkpointed 14.04 GB file, 206 million records, 10 GiB
+>   of pages and a 3.30 GB id index, opens in 12 ms. Heap after that
+>   open is 7 MB and process RSS is 18 MB. Id pairs stay a mapped sorted
+>   array and are binary-searched. Page bodies sit in a 64MB cache
+>   (`-max-memory`). Secondary indexes are still decoded into memory.
+>   A file built by normal commits also parses its whole commit log:
+>   the 1.05M bench file (about 47 MB of log) opens in 84 ms with 74 MB
+>   of heap.
 > - **Reads.** A cached point read is about 1 µs, whether by id or by an
->   indexed attribute. The first touch of a page is about 250 µs. The
->   same `email=` lookup with no index is 280 ms. Other filters still
->   scan the layer.
+>   indexed attribute. The first touch of a page is about 250 µs at
+>   1.05M, and 2.8 ms for the first `Users[id=1]` on the 14 GB file. The
+>   same `email=` lookup with no index is 280 ms at 1.05M. Other filters
+>   still scan the layer.
 > - **Writes** stay flat: a create is about 12 µs, and deleting a
 >   211-record account is under 1 ms.
-> - **A branch copies pages.** One branch plus one update grew the
->   unindexed file from 166 MB to 283 MB
+> - **A branch shares unchanged pages.** One branch plus one update grew
+>   the 1.05M file from 166 MB to 183 MB. The extra bytes are a second
+>   copy of the id pairs (16 bytes per record) and the one modified page.
+>   The same step used to reach 283 MB
 >   ([#36](https://github.com/Davidjustice28/basaldb/issues/36)).
 >
 > Known risks, fix first:
-> - **Don't let several processes write to the same file at once**: writes
->   can be lost silently ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
->   Use one writer, or route writes through `basald`. `basald` queues
->   concurrent requests on the same branch, so those writers don't have
->   to retry 409s themselves.
+> - **One process holds the file.** Open and Init take an exclusive lock
+>   on `file.bsl.lock` and keep it until Close. A second process waits
+>   up to 30 seconds, then fails with `database is locked` and a
+>   non-zero exit
+>   ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
+>   `basald` holds that lock for its whole run and queues concurrent
+>   HTTP writes on the same branch.
 > - A single attribute can still be up to 4 GiB, and reading that record
 >   pulls the whole value into the cache.
+> - Open time still grows with the commit log. The 50 ms figure above is
+>   a checkpointed file whose log is empty.
 >
-> The targets on the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42)
-> (10M+ records, a 10 GB file open in under 50 ms, indexed lookups under
-> 50 µs when the page is cold) are not met yet. Issues labeled
+> On the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42),
+> a 10 GB file opens in under 50 ms. Still ahead: 10M records through the
+> normal ingest path, and indexed lookups under 50 µs when the page is
+> cold. Issues labeled
 > [`priority: high`](https://github.com/Davidjustice28/basaldb/labels/priority%3A%20high)
 > are the queue.
 
@@ -138,7 +149,7 @@ tracking issue.
 
 | You might want to… | Status |
 |---|---|
-| Write from several processes at once | ⚠️ unsafe: writes can be lost without an error ([#4](https://github.com/Davidjustice28/basaldb/issues/4)) |
+| Write from several processes at once | one process holds `file.bsl.lock`; the other waits 30s, then exits with `database is locked` ([#4](https://github.com/Davidjustice28/basaldb/issues/4)) |
 | Run several statements in one transaction | one statement per call ([#22](https://github.com/Davidjustice28/basaldb/issues/22), [#1](https://github.com/Davidjustice28/basaldb/issues/1)) |
 | OR / IN filters, text search | AND equality/comparison only ([#9](https://github.com/Davidjustice28/basaldb/issues/9), [#10](https://github.com/Davidjustice28/basaldb/issues/10)) |
 | Sort by an attribute, paginate with offset | sort by id only, `limit` only ([#11](https://github.com/Davidjustice28/basaldb/issues/11)) |
@@ -410,8 +421,9 @@ Endpoints: `/v1/health`, `/v1/meta`, `/v1/query` (reads only),
 or `"branch"` in the JSON body to use a branch. Concurrent
 `/v1/execute` calls on one branch are queued.
 
-> Run **either** `basald` **or** CLI writes against a file, not both at
-> once ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
+> `basald` holds the file lock for its whole run. A CLI `Open` of that
+> same file waits 30 seconds, then exits with `database is locked`
+> ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 
 ---
 
@@ -509,16 +521,18 @@ cascade deleted 4 record(s) under 1 root(s) in "Users"
   [#49](https://github.com/Davidjustice28/basaldb/issues/49).
 - **Large bodies fit, and reading one loads that page.** An attribute
   can be up to 4 GiB and a record can have up to 2^32−1 children. The
-  page cache (default 64MB, `-max-memory`) holds recently read pages;
-  the id index stays resident. Blob attributes, stored out of line, are
+  page cache (default 64MB, `-max-memory`) holds recently read pages.
+  The id index is a mapped array. A secondary index stays resident.
+  Blob attributes, stored out of line, are
   planned in
   [#50](https://github.com/Davidjustice28/basaldb/issues/50).
 - **Use branches for speculative memory.** Let an agent write
   "hypotheses" on a branch and keep only what's confirmed.
 
-**Current gaps for agent workloads:** only one process can write to a
-file at a time, so give each agent its own file or route writes through
-`basald` ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
+**Current gaps for agent workloads:** one process holds the file lock,
+so give each agent its own file or route writes through `basald`. A
+second process gets `database is locked`
+([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 Branches can't be merged back yet
 ([#20](https://github.com/Davidjustice28/basaldb/issues/20)), and there's
 no text search ([#10](https://github.com/Davidjustice28/basaldb/issues/10)),

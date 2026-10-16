@@ -38,12 +38,15 @@ One file holds everything, in four regions (`pkg/engine/header.go`):
   and rewrites the file. It runs once the journal passes 8 MiB, or on
   request. A clean close doesn't checkpoint, so read-only use leaves the
   file byte-for-byte unchanged.
-- **Open** reads the header, the commit log, and the index region, then
-  replays the journal. Page bodies stay on disk until a read misses the
-  cache. Files written before the index region existed are scanned once
-  (one page at a time) to rebuild the directory and indexes; the next
-  checkpoint stores them. `-max-memory` (default 64MB) caps the decoded
-  page cache. The id index and secondary indexes remain resident.
+- **Open** reads the header and the commit log, maps the file, reads the
+  page directory out of the index region, and replays the journal. Id
+  pairs stay in that mapping and are binary-searched. Page bodies stay
+  on disk until a read misses the cache. Files written before the index
+  region existed are scanned once (one page at a time) to rebuild the
+  directory and indexes; the next checkpoint stores them.
+  `-max-memory` (default 64MB) caps the decoded page cache. Secondary
+  indexes are decoded and stay resident. The commit log is parsed in
+  full, so a long log still costs open time and RAM.
 
 ## Slotted pages
 
@@ -98,8 +101,11 @@ O(size of the database).
 
 A branch is a named head with its own commit history, forked from another
 branch at a commit (`branch.go`). In memory, branches share structure
-through the overlays. On disk, a checkpoint currently writes each
-branch's pages in full ([#36](https://github.com/Davidjustice28/basaldb/issues/36)).
+through the overlays. On disk, a checkpoint writes an unchanged page
+once and points every branch that still uses it at that offset. Each
+branch still stores its own id pairs (16 bytes per live record) and
+any page it has modified
+([#36](https://github.com/Davidjustice28/basaldb/issues/36)).
 Branches can't be merged yet ([#20](https://github.com/Davidjustice28/basaldb/issues/20)).
 
 ## Packages

@@ -382,7 +382,7 @@ func TestIndexReplayedFromJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Crash before checkpoint so open has to rebuild the index from the journal.
-	if err := db.f.Close(); err != nil {
+	if err := db.abandon(); err != nil {
 		t.Fatal(err)
 	}
 	db2, err := Open(path)

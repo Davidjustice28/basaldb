@@ -28,7 +28,7 @@ func TestLargeAttributeSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Crash before checkpoint: the value has to survive journal replay.
-	if err := db.f.Close(); err != nil {
+	if err := db.abandon(); err != nil {
 		t.Fatal(err)
 	}
 
