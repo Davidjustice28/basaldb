@@ -148,6 +148,77 @@ steps: secondary/ordered indexes for attribute scans (#33 part 3),
 page-level lazy loading for open time and RAM (#37), and batched
 ingest (#39).
 
+## Update: 2026-10-16 — #37 lazy pages, indexes persisted
+
+Working tree on `f9f8f0c` (not committed). A checkpoint writes the id
+index, and any secondary indexes, into an index region. Open reads that
+region and does not decode page bodies. Pages load on demand into a
+64 MB LRU (`-max-memory`). The stock bench schema is
+`Accounts(name,plan,region), Teams(name), Users(name,email,role,age)`
+with no secondary indexes, so `email` and `age` are still scans.
+
+Apple M3 Pro (12 cores, 18 GB), Go 1.27.2, `/usr/bin/time -l`. Same
+fan-out as the baseline table (5.6k is 100×5×10).
+
+### Size, memory, load
+
+| | 5.6k records | 211k records | 1.05M records |
+|---|---|---|---|
+| Bulk load | 24 ms (233k rec/s) | 868 ms (243k rec/s) | 9.9 s (106k rec/s) |
+| File after checkpoint | 0.8 MB (147 B/rec) | 32.5 MB (154 B/rec) | 166.0 MB (157 B/rec) |
+| Heap after load | 5 MB | 29 MB | 120 MB |
+| Peak RSS | 22 MB | 202 MB | 922 MB |
+| Cold open | <1 ms | 12 ms | 78 ms |
+
+Heap-after-load is measured before checkpoint, while ingest still holds
+every page. Peak RSS is that ingest. At 1.05M versus the 2026-10-14 M3
+baseline: cold open 483 ms → 78 ms, heap after load 332 MB → 120 MB,
+peak RSS 1.8 GB → 922 MB. Open time still grows with record count
+because the id index stays resident. A 10 GB file was not measured.
+
+### Reads (BQL, in-process, p50)
+
+| Query | 5.6k | 211k | 1.05M |
+|---|---|---|---|
+| `GET Accounts[id=N]` | 1 µs | 1 µs | 1 µs |
+| `GET Users[id=N]` | 1 µs | 232 µs | 241 µs |
+| `GET Users[email=X]` (no index) | 194 µs | 7.4 ms | 280 ms |
+| subtree, 200 rows | 6 µs | 22 µs | 47 µs |
+| `GET Users[age=(gt=60),role=admin]` | 394 µs | 15.0 ms | 315 ms |
+| `GET Users[*][limit=10,sort=desc]` | 2 µs | 15 µs | 91 µs |
+| Parallel subtree reads, 12 goroutines | 67k q/s | 21k q/s | 14k q/s |
+
+`GET Users[id=N]` stays near 240 µs from 211k to 1.05M. After a lazy
+open that is one page load per random id. It is not a layer scan: the
+unindexed email scan is 7.4 ms at 211k and 280 ms at 1.05M. At 5.6k the
+file fits in the page cache, so the same lookup stays at 1 µs. The
+1.05M email scan is slower than the old in-memory 60.9 ms because the
+166 MB file does not fit in the 64 MB cache, so each scan reads pages
+again. The harness still prints `cold open (load whole file)` and
+`GET Users[id=N] (scans whole layer)`; those labels predate this change.
+
+### Writes (BQL, one commit each, in-process, p50)
+
+| Operation | 5.6k | 211k | 1.05M |
+|---|---|---|---|
+| `CREATE Users PARENT Teams[id=N]` | 13 µs | 10 µs | 12 µs |
+| `UPDATE Users[id=N][role=X]` | 8 µs | 9 µs | 14 µs |
+| `DELETE Accounts[id=N]` | 178 µs (63 records) | 351 µs (211 records) | 571 µs (211 records) |
+| `DELETE Teams[id=N]` | 35 µs | 59 µs | 57 µs |
+| CREATE with fsync | 3.0 ms | 3.0 ms | 1.8 ms |
+| Journal bytes per write | 232 | 239 | 241 |
+
+### Branches
+
+| | 5.6k | 211k | 1.05M |
+|---|---|---|---|
+| Branch create | 33 µs | 23 µs | 19 µs |
+| Heap with 2 branches | 1 MB | 20 MB | 114 MB |
+| File size, before → after branch + 1 update | 0.9 → 1.5 MB | 32.6 → 55.6 MB | 166.0 → 283.2 MB |
+
+Branch page duplication (#36) is unchanged. These runs do not declare
+`email!`, so they do not measure secondary indexes (#45).
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
@@ -162,11 +233,19 @@ ingest (#39).
     fixed 2026-10-14: O(subtree), see update above)
   - every CLI call rewrites the whole file (#32, fixed 2026-10-14: a
     clean close no longer checkpoints)
-- **Memory and storage:** the whole database lives in RAM (#37), and
-  each branch adds a near-full copy on disk (#36).
+- **Memory and storage:** the 2026-10-16 table is the lazy-load
+  measurement. A checkpointed file opens from its index region (id
+  index and secondary indexes resident, page bodies cached up to
+  `-max-memory`, default 64MB). Cold open at 1.05M is 78 ms and still
+  grows with the id index. Each branch still adds a near-full copy of
+  its pages on disk (#36). Ingest peak RSS is still the in-memory load
+  that checkpoint later releases.
 
-**Today:** good for internal testing up to about 50k records per file,
-with a single writer, ideally through `basald` or the Go packages
-rather than the CLI. See [#42](https://github.com/Davidjustice28/basaldb/issues/42)
-for the plan and targets (10M+ records, ≥100k records/s ingest, <50 µs
-indexed lookups, bounded RAM).
+**Today:** a single writer, through `basald` or the Go packages, handles
+about 1M records with ~10 µs creates and indexed id lookups that fault
+one page (~240 µs when that page is not cached). Unindexed attribute
+scans still read the layer, and they re-read it when the file is larger
+than the page cache. See
+[#42](https://github.com/Davidjustice28/basaldb/issues/42) for the plan
+and targets (10M+ records, ≥100k records/s ingest, <50 µs indexed
+lookups, bounded RAM).

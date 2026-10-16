@@ -1,13 +1,15 @@
 package engine
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,16 +86,134 @@ const maxOverlayDepth = 256
 // the base, the total copy work over a stream of commits stays amortized
 // O(1) per commit.
 type layerState struct {
-	base     *layerState       // shared immutable parent (nil for a root)
-	pages    map[uint64]*Page  // pages created/modified relative to base
-	idIndex  map[uint64]uint64 // ids added relative to base
-	dels     map[uint64]bool   // ids deleted relative to base (tombstones)
+	base     *layerState           // shared immutable parent (nil for a root)
+	pages    map[uint64]*Page      // pages created/modified relative to base
+	idIndex  map[uint64]uint64     // ids added relative to base
+	dels     map[uint64]bool       // ids deleted relative to base (tombstones)
+	indexes  map[string]*attrIndex // attr name -> COW hash index tip at this level
+	disk     *diskLayer            // immutable page directory (roots only)
 	nextSlot uint64
 	count    int // live records, maintained across the overlay chain
 }
 
 func newLayerState() *layerState {
-	return &layerState{pages: map[uint64]*Page{}, idIndex: map[uint64]uint64{}}
+	return &layerState{
+		pages:   map[uint64]*Page{},
+		idIndex: map[uint64]uint64{},
+		indexes: map[string]*attrIndex{},
+	}
+}
+
+// bindSchema creates an empty hash index for every declared indexed
+// attribute so equality lookups hit the index even when the layer is empty.
+func (l *layerState) bindSchema(def Layer) {
+	if l.indexes == nil {
+		l.indexes = map[string]*attrIndex{}
+	}
+	for _, name := range def.Indexed {
+		pos, ok := def.AttrIndex(name)
+		if !ok {
+			continue
+		}
+		canon := def.Attrs[pos]
+		if l.indexes[canon] == nil {
+			l.indexes[canon] = newAttrIndex()
+		}
+	}
+}
+
+// absorb indexes one decoded record into a root that is not published yet
+// (open-time rebuild). It does not touch pages.
+func (l *layerState) absorb(def Layer, rec *Record) {
+	l.idIndex[rec.ID] = rec.Slot
+	if rec.Slot >= l.nextSlot {
+		l.nextSlot = rec.Slot + 1
+	}
+	l.count++
+	l.indexInsert(def, rec)
+}
+
+func (l *layerState) indexInsert(def Layer, rec *Record) {
+	if rec == nil {
+		return
+	}
+	for _, name := range def.Indexed {
+		pos, ok := def.AttrIndex(name)
+		if !ok || pos >= len(rec.Attrs) {
+			continue
+		}
+		l.indexForWrite(def.Attrs[pos]).add(rec.Attrs[pos], rec.ID)
+	}
+}
+
+func (l *layerState) indexRemove(def Layer, rec *Record) {
+	if rec == nil {
+		return
+	}
+	for _, name := range def.Indexed {
+		pos, ok := def.AttrIndex(name)
+		if !ok || pos >= len(rec.Attrs) {
+			continue
+		}
+		l.indexForWrite(def.Attrs[pos]).drop(rec.Attrs[pos], rec.ID)
+	}
+}
+
+// tipIndex returns the newest index node for name, walking the overlay
+// chain. nil means the attribute is not indexed.
+func (l *layerState) tipIndex(name string) *attrIndex {
+	canon := name
+	for cur := l; cur != nil; cur = cur.base {
+		if cur.indexes == nil {
+			continue
+		}
+		if ix := cur.indexes[name]; ix != nil {
+			return ix
+		}
+		for n, ix := range cur.indexes {
+			if strings.EqualFold(n, name) && ix != nil {
+				canon = n
+				return cur.indexes[canon]
+			}
+		}
+	}
+	return nil
+}
+
+// indexForWrite returns an index node this layer may mutate. A node shared
+// with the parent is wrapped first so a published snapshot's put map stays
+// immutable.
+func (l *layerState) indexForWrite(name string) *attrIndex {
+	if l.indexes == nil {
+		l.indexes = map[string]*attrIndex{}
+	}
+	var parent *attrIndex
+	if l.base != nil {
+		parent = l.base.tipIndex(name)
+	}
+	cur := l.indexes[name]
+	if cur == nil || cur == parent {
+		wrapped := &attrIndex{base: parent, put: map[string]map[uint64]struct{}{}}
+		if cur != nil {
+			wrapped.base = cur
+		}
+		l.indexes[name] = wrapped
+		return wrapped
+	}
+	return cur
+}
+
+// idsByAttr resolves an equality lookup. The bool is false when name has
+// no index (the caller should scan). An empty slice with true is a miss.
+func (l *layerState) idsByAttr(name, val string) ([]uint64, bool) {
+	if l == nil {
+		return nil, false
+	}
+	tip := l.tipIndex(name)
+	if tip == nil {
+		return nil, false
+	}
+	return tip.lookup(val), true
 }
 
 // overlay returns a writable, initially empty copy-on-write layer on top of
@@ -102,21 +222,92 @@ func (l *layerState) overlay() *layerState {
 	if l == nil {
 		return newLayerState()
 	}
+	indexes := make(map[string]*attrIndex, len(l.indexes))
+	for k, v := range l.indexes {
+		indexes[k] = v
+	}
 	return &layerState{
 		base:     l,
 		pages:    map[uint64]*Page{},
 		idIndex:  map[uint64]uint64{},
+		indexes:  indexes,
 		nextSlot: l.nextSlot,
 		count:    l.count,
 	}
 }
 
-// page returns the page with the given index, consulting the overlay chain
-// top-down (the most recent entry wins).
+// page returns the page with the given index. Overlay pages win. A miss
+// loads from the page directory into the shared cache and does not write
+// the published pages map.
 func (l *layerState) page(idx uint64) *Page {
-	for ; l != nil; l = l.base {
-		if p := l.pages[idx]; p != nil {
+	var disk *diskLayer
+	var loc pageLoc
+	var onDisk bool
+	for cur := l; cur != nil; cur = cur.base {
+		if p := cur.pages[idx]; p != nil {
 			return p
+		}
+		if !onDisk && cur.disk != nil {
+			if pl, ok := cur.disk.refs[idx]; ok {
+				disk, loc, onDisk = cur.disk, pl, true
+			}
+		}
+	}
+	if !onDisk {
+		return nil
+	}
+	p, err := disk.load(idx, loc)
+	if err != nil {
+		disk.gen.noteErr(err)
+		return nil
+	}
+	return p
+}
+
+// onDisk reports whether any level has a directory entry for idx.
+func (l *layerState) onDisk(idx uint64) bool {
+	for ; l != nil; l = l.base {
+		if l.disk != nil {
+			if _, ok := l.disk.refs[idx]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pageIndexes returns every page index visible through the overlay chain.
+func (l *layerState) pageIndexes() []uint64 {
+	seen := map[uint64]struct{}{}
+	var idxs []uint64
+	for cur := l; cur != nil; cur = cur.base {
+		for idx := range cur.pages {
+			if _, ok := seen[idx]; ok {
+				continue
+			}
+			seen[idx] = struct{}{}
+			idxs = append(idxs, idx)
+		}
+		if cur.disk == nil {
+			continue
+		}
+		for idx := range cur.disk.refs {
+			if _, ok := seen[idx]; ok {
+				continue
+			}
+			seen[idx] = struct{}{}
+			idxs = append(idxs, idx)
+		}
+	}
+	return idxs
+}
+
+func (l *layerState) loadErr() error {
+	for ; l != nil; l = l.base {
+		if l.disk != nil && l.disk.gen != nil {
+			if err := l.disk.gen.err(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -164,22 +355,6 @@ func (l *layerState) dropID(id uint64) {
 	l.dels[id] = true
 }
 
-// allPages merges the overlay chain into one index -> page map (topmost
-// entry wins). The result must be treated as read-only.
-func (l *layerState) allPages() map[uint64]*Page {
-	if l == nil {
-		return nil
-	}
-	out := map[uint64]*Page{}
-	if l.base != nil {
-		out = l.base.allPages()
-	}
-	for idx, p := range l.pages {
-		out[idx] = p
-	}
-	return out
-}
-
 // materialize flattens the overlay chain into a self-contained root state;
 // a root is returned unchanged. The root's maps are copied exactly once
 // and each level's deltas applied on top (a recursive copy per level would
@@ -197,6 +372,8 @@ func (l *layerState) materialize() *layerState {
 	c := &layerState{
 		pages:    make(map[uint64]*Page, len(root.pages)+len(l.pages)),
 		idIndex:  make(map[uint64]uint64, len(root.idIndex)+len(l.idIndex)),
+		indexes:  flattenIndexMap(l),
+		disk:     root.disk,
 		nextSlot: l.nextSlot,
 		count:    l.count,
 	}
@@ -221,6 +398,23 @@ func (l *layerState) materialize() *layerState {
 	return c
 }
 
+// flattenIndexMap copies every live secondary index into a root node.
+func flattenIndexMap(l *layerState) map[string]*attrIndex {
+	names := map[string]struct{}{}
+	for cur := l; cur != nil; cur = cur.base {
+		for n := range cur.indexes {
+			names[n] = struct{}{}
+		}
+	}
+	out := make(map[string]*attrIndex, len(names))
+	for n := range names {
+		if tip := l.tipIndex(n); tip != nil {
+			out[n] = tip.flatten()
+		}
+	}
+	return out
+}
+
 // copyRoot returns a deep copy of a materialized state whose pages may keep
 // being mutated in place by an unpublished view (journal replay forks).
 func (l *layerState) copyRoot() *layerState {
@@ -228,6 +422,8 @@ func (l *layerState) copyRoot() *layerState {
 	c := &layerState{
 		pages:    make(map[uint64]*Page, len(m.pages)),
 		idIndex:  make(map[uint64]uint64, len(m.idIndex)),
+		indexes:  flattenIndexMap(m),
+		disk:     m.disk,
 		nextSlot: m.nextSlot,
 		count:    m.count,
 	}
@@ -325,17 +521,42 @@ func (mv *matrixView) Records(layer int) []*Record {
 	if ls == nil {
 		return nil
 	}
-	pages := ls.allPages()
-	idxs := make([]uint64, 0, len(pages))
-	for idx := range pages {
-		idxs = append(idxs, idx)
-	}
+	idxs := ls.pageIndexes()
 	sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
 	var out []*Record
 	for _, idx := range idxs {
-		out = append(out, pages[idx].Slots()...)
+		p := ls.page(idx)
+		if p == nil {
+			continue
+		}
+		out = append(out, p.Slots()...)
 	}
 	return out
+}
+
+// Walk visits live records of a layer in slot order and stops when fn
+// returns false. reverse walks high slots first, which is descending id
+// order within a layer because ids are assigned alongside slots.
+func (mv *matrixView) Walk(layer int, reverse bool, fn func(*Record) bool) {
+	ls := mv.layers[layer]
+	if ls == nil {
+		return
+	}
+	idxs := ls.pageIndexes()
+	if reverse {
+		sort.Slice(idxs, func(i, j int) bool { return idxs[i] > idxs[j] })
+	} else {
+		sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
+	}
+	for _, idx := range idxs {
+		p := ls.page(idx)
+		if p == nil {
+			continue
+		}
+		if !p.visit(reverse, fn) {
+			return
+		}
+	}
 }
 
 // Roots returns the records of a layer without a parent (matrix row heads).
@@ -370,6 +591,36 @@ func (mv *matrixView) Children(layer int, id uint64) []*Record {
 	return out
 }
 
+// IDsByAttr returns ids whose indexed attribute equals val, in ascending
+// id order. The bool is false when the attribute has no hash index.
+func (mv *matrixView) IDsByAttr(layer int, field, val string) ([]uint64, bool) {
+	ls := mv.layers[layer]
+	if ls == nil {
+		return nil, false
+	}
+	name := field
+	if def, ok := mv.hdr.Layers[layer]; ok {
+		if pos, err := strconv.Atoi(field); err == nil && pos >= 0 && pos < len(def.Attrs) {
+			name = def.Attrs[pos]
+		} else if p, ok := def.AttrIndex(field); ok {
+			name = def.Attrs[p]
+		}
+	}
+	return ls.idsByAttr(name, val)
+}
+
+// ReadErr returns the first page-read error observed while serving this
+// snapshot. A nil page from a failed read is also recorded here so a query
+// does not silently drop records.
+func (mv *matrixView) ReadErr() error {
+	for _, ls := range mv.layers {
+		if err := ls.loadErr(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Count returns the number of live records in a layer.
 func (mv *matrixView) Count(layer int) int {
 	if ls := mv.layers[layer]; ls != nil {
@@ -384,6 +635,7 @@ func (mv *matrixView) Count(layer int) int {
 type editView struct {
 	*matrixView
 	cloned map[int]map[uint64]bool // layer -> page index already cloned in this view
+	err    error                   // sticky page-read failure; Commit refuses to publish
 }
 
 func newEditView(hdr *Header, layers map[int]*layerState) *editView {
@@ -408,6 +660,9 @@ func (e *editView) layer(h int) *layerState {
 	ls := e.layers[h]
 	if ls == nil {
 		ls = newLayerState()
+		if def, ok := e.hdr.Layers[h]; ok {
+			ls.bindSchema(def)
+		}
 		e.layers[h] = ls
 	}
 	return ls
@@ -417,12 +672,21 @@ func (e *editView) layer(h int) *layerState {
 // first when it is still shared with an older snapshot.
 func (e *editView) pageForWrite(layer int, idx uint64) *Page {
 	ls := e.layer(layer)
+	if e.err != nil {
+		return NewPage(layer, idx*SlotsPerPage)
+	}
 	if e.cloned[layer][idx] {
 		return ls.pages[idx]
 	}
 	var p *Page
 	if base := ls.page(idx); base != nil {
 		p = base.Clone()
+	} else if ls.onDisk(idx) {
+		e.err = ls.loadErr()
+		if e.err == nil {
+			e.err = fmt.Errorf("engine: page %d unreadable", idx)
+		}
+		return NewPage(layer, idx*SlotsPerPage)
 	} else {
 		p = NewPage(layer, idx*SlotsPerPage)
 	}
@@ -435,6 +699,9 @@ func (e *editView) pageForWrite(layer int, idx uint64) *Page {
 func (e *editView) put(layer int, rec *Record) {
 	ls := e.layer(layer)
 	p := e.pageForWrite(layer, rec.Slot/SlotsPerPage)
+	if e.err != nil {
+		return
+	}
 	_ = p.Put(rec)
 	if _, ok := ls.slotOf(rec.ID); !ok {
 		ls.count++
@@ -456,6 +723,9 @@ func (e *editView) remove(layer int, id uint64) bool {
 		return false
 	}
 	p := e.pageForWrite(layer, x/SlotsPerPage)
+	if e.err != nil {
+		return false
+	}
 	p.Invalidate(x)
 	ls.dropID(id)
 	return true
@@ -471,7 +741,11 @@ func (e *editView) invalidateRange(layer int, start, count uint64) {
 		if n > count {
 			n = count
 		}
-		e.pageForWrite(layer, idx).InvalidateRange(start, n)
+		p := e.pageForWrite(layer, idx)
+		if e.err != nil {
+			return
+		}
+		p.InvalidateRange(start, n)
 		start += n
 		count -= n
 	}
@@ -490,7 +764,30 @@ func (e *editView) recordForWrite(layer int, id uint64) *Record {
 	}
 	c := rec.Clone()
 	e.put(layer, c)
+	if e.err != nil {
+		return nil
+	}
 	return c
+}
+
+func (e *editView) indexInsert(layer int, rec *Record) {
+	def, ok := e.hdr.Layers[layer]
+	if !ok {
+		return
+	}
+	e.layer(layer).indexInsert(def, rec)
+}
+
+func (e *editView) indexRemove(layer int, rec *Record) {
+	def, ok := e.hdr.Layers[layer]
+	if !ok {
+		return
+	}
+	ls := e.layers[layer]
+	if ls == nil {
+		return
+	}
+	ls.indexRemove(def, rec)
 }
 
 // Snapshot is an immutable point-in-time view of one branch. Reads through a
@@ -534,6 +831,10 @@ type DB struct {
 	ckptThreshold uint64 // journal bytes that trigger an automatic checkpoint
 
 	wmu sync.Mutex // serializes writers: commits, branch events, checkpoints
+
+	gen   *fileGen
+	cache *pageCache
+	epoch atomic.Uint64 // bumped when the schema gains an index; in-flight txs conflict
 
 	mu         sync.RWMutex
 	nextCommit uint64
@@ -586,6 +887,8 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 		CommitLogEnd:   HeaderBlockSize,
 		DataStart:      HeaderBlockSize,
 		DataEnd:        HeaderBlockSize,
+		IndexStart:     HeaderBlockSize,
+		IndexEnd:       HeaderBlockSize,
 		JournalStart:   HeaderBlockSize,
 	}
 	block, err := hdr.Marshal()
@@ -608,7 +911,10 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 	if err := c.Validate(); err != nil {
 		return fail(err)
 	}
-	jrec := marshalJournalCommit(c, nil)
+	jrec, err := marshalJournalCommit(c, nil)
+	if err != nil {
+		return fail(err)
+	}
 	if _, err := f.WriteAt(jrec, HeaderBlockSize); err != nil {
 		return fail(err)
 	}
@@ -618,7 +924,9 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 
 	layerStates := make(map[int]*layerState, len(layers))
 	for _, l := range layers {
-		layerStates[l.Height] = newLayerState()
+		ls := newLayerState()
+		ls.bindSchema(l)
+		layerStates[l.Height] = ls
 	}
 	snap := &Snapshot{Branch: DefaultBranch, Commit: 1, matrixView: matrixView{hdr: hdr, layers: layerStates}}
 
@@ -628,6 +936,7 @@ func Init(path string, layers []Layer, meta TxMeta) (*DB, error) {
 		f:             f,
 		journalOff:    HeaderBlockSize + uint64(len(jrec)),
 		ckptThreshold: journalCheckpointBytes,
+		cache:         newPageCache(DefaultCacheBytes),
 		commits:       map[uint64]*Commit{1: c},
 		forks:         map[string]string{DefaultBranch: ""},
 		events:        []LogEntry{{Commit: c}},
@@ -697,11 +1006,6 @@ func Open(path string) (*DB, error) {
 		f.Close()
 		return nil, err
 	}
-	dataBytes, err := readRegion(f, hdr.DataStart, hdr.DataEnd)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
 	journalBytes, err := readRegion(f, hdr.JournalStart, uint64(size))
 	if err != nil {
 		f.Close()
@@ -713,10 +1017,26 @@ func Open(path string) (*DB, error) {
 		f.Close()
 		return nil, err
 	}
-	states, maxID, err := loadPageBlocks(dataBytes)
-	if err != nil {
-		f.Close()
-		return nil, err
+	gen := &fileGen{f: f, wide: hdr.Version != VersionV10, cache: newPageCache(DefaultCacheBytes)}
+	var states map[string]map[int]*layerState
+	var maxID uint64
+	if hdr.IndexEnd > hdr.IndexStart {
+		indexBytes, err := readRegion(f, hdr.IndexStart, hdr.IndexEnd)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		states, maxID, err = decodeIndex(indexBytes, gen)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+	} else {
+		states, maxID, err = scanDataPages(f, hdr, gen)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 	jrecs, err := parseJournal(journalBytes)
 	if err != nil {
@@ -824,6 +1144,8 @@ func Open(path string) (*DB, error) {
 		path:          path,
 		hdr:           hdr,
 		f:             f,
+		gen:           gen,
+		cache:         gen.cache,
 		journalOff:    uint64(size),
 		ckptThreshold: journalCheckpointBytes,
 		commits:       commits,
@@ -856,57 +1178,6 @@ func readRegion(f *os.File, start, end uint64) ([]byte, error) {
 	return buf, nil
 }
 
-// loadPageBlocks decodes the slotted binary data region into per-branch
-// layer states: [u32 blockLen][u16 branchLen][branch][page bytes]...
-func loadPageBlocks(data []byte) (map[string]map[int]*layerState, uint64, error) {
-	states := map[string]map[int]*layerState{}
-	var maxID uint64
-	off := 0
-	for off < len(data) {
-		if len(data)-off < 4 {
-			return nil, 0, fmt.Errorf("%w: truncated page block header", ErrCorruptPage)
-		}
-		blockLen := int(binary.LittleEndian.Uint32(data[off:]))
-		off += 4
-		if blockLen < 2 || len(data)-off < blockLen {
-			return nil, 0, fmt.Errorf("%w: truncated page block (%d bytes)", ErrCorruptPage, blockLen)
-		}
-		block := data[off : off+blockLen]
-		off += blockLen
-		nameLen := int(binary.LittleEndian.Uint16(block[0:2]))
-		if nameLen <= 0 || 2+nameLen > len(block) {
-			return nil, 0, fmt.Errorf("%w: bad branch tag in page block", ErrCorruptPage)
-		}
-		branch := string(block[2 : 2+nameLen])
-		page, err := UnmarshalPage(block[2+nameLen:])
-		if err != nil {
-			return nil, 0, err
-		}
-		lsMap := states[branch]
-		if lsMap == nil {
-			lsMap = map[int]*layerState{}
-			states[branch] = lsMap
-		}
-		ls := lsMap[page.Layer]
-		if ls == nil {
-			ls = newLayerState()
-			lsMap[page.Layer] = ls
-		}
-		ls.pages[page.SlotBase/SlotsPerPage] = page
-		for _, rec := range page.Slots() {
-			ls.idIndex[rec.ID] = rec.Slot
-			if rec.Slot >= ls.nextSlot {
-				ls.nextSlot = rec.Slot + 1
-			}
-			if rec.ID > maxID {
-				maxID = rec.ID
-			}
-			ls.count++
-		}
-	}
-	return states, maxID, nil
-}
-
 // applyOp replays one journal mutation into a branch's edit view. Replaying
 // the same journal always reproduces the same matrix state (cascade deletes
 // re-run the same bitmask invalidation on the same child pointer arrays).
@@ -916,7 +1187,19 @@ func applyOp(view *editView, op Op) error {
 		if op.Record == nil {
 			return fmt.Errorf("engine: journal op %d carries no record", op.Kind)
 		}
-		view.put(op.Layer, op.Record.Clone())
+		rec := op.Record.Clone()
+		if op.Kind == opUpdate {
+			if ls := view.layers[op.Layer]; ls != nil {
+				if old := ls.record(rec.ID); old != nil {
+					view.indexRemove(op.Layer, old)
+				}
+			}
+		}
+		view.put(op.Layer, rec)
+		if view.err != nil {
+			return view.err
+		}
+		view.indexInsert(op.Layer, rec)
 		return nil
 	case opDelete:
 		_, err := cascadeDelete(view, op.Layer, op.ID)
@@ -959,6 +1242,7 @@ type WriteTx struct {
 	view   *editView
 	ops    []Op
 	done   bool
+	epoch  uint64
 }
 
 // Begin starts a write transaction on top of the branch head snapshot.
@@ -985,6 +1269,7 @@ func (db *DB) Begin(branch string, meta TxMeta) (*WriteTx, error) {
 		meta:   meta,
 		base:   base,
 		view:   newEditView(db.hdr, layers),
+		epoch:  db.epoch.Load(),
 	}, nil
 }
 
@@ -997,6 +1282,25 @@ func (tx *WriteTx) Base() *Snapshot { return tx.base }
 func (tx *WriteTx) check() error {
 	if tx.done {
 		return ErrTxDone
+	}
+	return nil
+}
+
+// validateAttrSizes rejects an attribute list that cannot be stored in a
+// v1.1 tuple. The check happens before any mutation so a too-large value
+// never reaches the journal.
+func validateAttrSizes(layer Layer, attrs []string) error {
+	if uint64(len(attrs)) > math.MaxUint32 {
+		return fmt.Errorf("engine: record has %d attributes, max %d", len(attrs), uint64(math.MaxUint32))
+	}
+	for i, a := range attrs {
+		if uint64(len(a)) > math.MaxUint32 {
+			name := strconv.Itoa(i)
+			if i < len(layer.Attrs) {
+				name = layer.Attrs[i]
+			}
+			return fmt.Errorf("engine: attribute %q is %d bytes, max %d", name, len(a), uint64(math.MaxUint32))
+		}
 	}
 	return nil
 }
@@ -1015,10 +1319,17 @@ func (tx *WriteTx) Create(layerName string, parentID uint64, attrs []string) (*R
 	if parentID != 0 && height == 0 {
 		return nil, errors.New("engine: records of the root layer cannot have a parent")
 	}
+	layer := tx.db.hdr.Layers[height]
+	if err := validateAttrSizes(layer, attrs); err != nil {
+		return nil, err
+	}
 	if parentID != 0 {
 		parent, ok := tx.view.Record(height-1, parentID)
 		if !ok {
 			return nil, fmt.Errorf("engine: parent %d not found in layer %q", parentID, tx.db.hdr.layerName(height-1))
+		}
+		if uint64(len(parent.Children)) >= math.MaxUint32 {
+			return nil, fmt.Errorf("engine: record %d already has %d children, max %d", parentID, len(parent.Children), uint64(math.MaxUint32))
 		}
 		p := tx.view.recordForWrite(height-1, parentID)
 		if p == nil {
@@ -1037,6 +1348,10 @@ func (tx *WriteTx) Create(layerName string, parentID uint64, attrs []string) (*R
 	}
 	ls.nextSlot++
 	tx.view.put(height, rec)
+	if tx.view.err != nil {
+		return nil, tx.view.err
+	}
+	tx.view.indexInsert(height, rec)
 
 	if parentID != 0 {
 		p := tx.view.recordForWrite(height-1, parentID)
@@ -1055,11 +1370,24 @@ func (tx *WriteTx) Update(layerName string, id uint64, attrs []string) (*Record,
 	if err != nil {
 		return nil, err
 	}
+	old, ok := tx.view.Record(height, id)
+	if !ok {
+		return nil, fmt.Errorf("engine: record %d not found in layer %q", id, layerName)
+	}
+	if err := validateAttrSizes(tx.db.hdr.Layers[height], attrs); err != nil {
+		return nil, err
+	}
+	prev := old.Clone()
 	rec := tx.view.recordForWrite(height, id)
+	if tx.view.err != nil {
+		return nil, tx.view.err
+	}
 	if rec == nil {
 		return nil, fmt.Errorf("engine: record %d not found in layer %q", id, layerName)
 	}
+	tx.view.indexRemove(height, prev)
 	rec.Attrs = append([]string(nil), attrs...)
+	tx.view.indexInsert(height, rec)
 	tx.ops = append(tx.ops, Op{Kind: opUpdate, Layer: height, Record: rec.Clone()})
 	return rec.Clone(), nil
 }
@@ -1105,6 +1433,16 @@ func (tx *WriteTx) Children(layerName string, id uint64) ([]*Record, error) {
 	return tx.view.Children(height, id), nil
 }
 
+// IDsByAttr resolves an indexed equality inside the transaction, including
+// this transaction's own writes.
+func (tx *WriteTx) IDsByAttr(layerName, field, val string) ([]uint64, bool) {
+	height, err := tx.view.height(layerName)
+	if err != nil {
+		return nil, false
+	}
+	return tx.view.IDsByAttr(height, field, val)
+}
+
 // Commit appends the commit block to the journal and atomically publishes
 // the new branch head. Concurrent readers keep their snapshots; concurrent
 // writers on other branches proceed. If the branch head moved since Begin,
@@ -1128,9 +1466,12 @@ func (tx *WriteTx) Commit() (*Snapshot, error) {
 	if cur == nil {
 		return nil, fmt.Errorf("engine: unknown branch %q", tx.branch)
 	}
-	if cur.Commit != tx.base.Commit {
+	if cur.Commit != tx.base.Commit || tx.epoch != db.epoch.Load() {
 		return nil, fmt.Errorf("%w: branch %q head moved from commit %d to %d",
 			ErrConflict, tx.branch, tx.base.Commit, cur.Commit)
+	}
+	if tx.view.err != nil {
+		return nil, tx.view.err
 	}
 
 	db.mu.Lock()
@@ -1151,7 +1492,22 @@ func (tx *WriteTx) Commit() (*Snapshot, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	if err := db.appendJournal(marshalJournalCommit(c, tx.ops)); err != nil {
+	// Also reject a parent whose child list no longer fits on disk. Create
+	// checks before each append; this is the backstop for anything else
+	// that mutated a record before the journal write.
+	for _, op := range tx.ops {
+		if op.Record == nil {
+			continue
+		}
+		if err := recordFits(op.Record, true); err != nil {
+			return nil, err
+		}
+	}
+	jrec, err := marshalJournalCommit(c, tx.ops)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.appendJournal(jrec); err != nil {
 		return nil, err
 	}
 
@@ -1249,7 +1605,26 @@ func (db *DB) checkpointLocked() error {
 	sort.Strings(branchNames)
 
 	st := db.state.Load()
-	var data bytes.Buffer
+	logBytes := []byte(logText)
+	tmp := db.path + ".tmp"
+	os.Remove(tmp)
+	tf, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error {
+		tf.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if _, err := tf.Write(make([]byte, HeaderBlockSize)); err != nil {
+		return fail(err)
+	}
+	if _, err := tf.Write(logBytes); err != nil {
+		return fail(err)
+	}
+	off := uint64(HeaderBlockSize + len(logBytes))
+	metas := map[string]map[int]*layerMeta{}
 	var blockLen [4]byte
 	var nameLen [2]byte
 	for _, branch := range branchNames {
@@ -1262,69 +1637,77 @@ func (db *DB) checkpointLocked() error {
 			if ls == nil {
 				continue
 			}
-			pages := ls.allPages()
-			idxs := make([]uint64, 0, len(pages))
-			for idx := range pages {
-				idxs = append(idxs, idx)
-			}
+			lm := exportLayer(ls, height)
+			idxs := ls.pageIndexes()
 			sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
 			for _, idx := range idxs {
-				pageBytes, err := pages[idx].MarshalBinary()
+				p := ls.page(idx)
+				if p == nil {
+					if err := ls.loadErr(); err != nil {
+						return fail(err)
+					}
+					return fail(fmt.Errorf("engine: missing page %d while checkpointing %s", idx, branch))
+				}
+				pageBytes, err := p.MarshalBinary()
 				if err != nil {
-					return err
+					return fail(err)
 				}
 				payload := make([]byte, 0, 2+len(branch)+len(pageBytes))
 				binary.LittleEndian.PutUint16(nameLen[:], uint16(len(branch)))
 				payload = append(payload, nameLen[:]...)
 				payload = append(payload, branch...)
 				payload = append(payload, pageBytes...)
+				if len(payload) > int(^uint32(0)) {
+					return fail(fmt.Errorf("engine: page block exceeds uint32"))
+				}
 				binary.LittleEndian.PutUint32(blockLen[:], uint32(len(payload)))
-				data.Write(blockLen[:])
-				data.Write(payload)
+				if _, err := tf.Write(blockLen[:]); err != nil {
+					return fail(err)
+				}
+				if _, err := tf.Write(payload); err != nil {
+					return fail(err)
+				}
+				lm.refs[idx] = pageLoc{off: off, n: uint32(len(payload))}
+				off += 4 + uint64(len(payload))
 			}
+			if metas[branch] == nil {
+				metas[branch] = map[int]*layerMeta{}
+			}
+			metas[branch][height] = lm
 		}
 	}
+	dataEnd := off
+	indexBytes, err := encodeIndex(branchNames, metas)
+	if err != nil {
+		return fail(err)
+	}
+	if _, err := tf.Write(indexBytes); err != nil {
+		return fail(err)
+	}
+	indexEnd := dataEnd + uint64(len(indexBytes))
 
-	logBytes := []byte(logText)
 	hdr := *db.hdr
+	// A checkpoint rewrites every tuple in the wide layout, so the file
+	// becomes 1.1 even when it was opened as 1.0.
+	hdr.Version = CurrentVersion
 	hdr.Branches = branchNames
 	hdr.CommitLogStart = HeaderBlockSize
-	hdr.CommitLogEnd = hdr.CommitLogStart + uint64(len(logBytes))
+	hdr.CommitLogEnd = HeaderBlockSize + uint64(len(logBytes))
 	hdr.DataStart = hdr.CommitLogEnd
-	hdr.DataEnd = hdr.DataStart + uint64(data.Len())
-	hdr.JournalStart = hdr.DataEnd
+	hdr.DataEnd = dataEnd
+	hdr.IndexStart = dataEnd
+	hdr.IndexEnd = indexEnd
+	hdr.JournalStart = indexEnd
 	block, err := hdr.Marshal()
 	if err != nil {
-		return err
-	}
-
-	tmp := db.path + ".tmp"
-	os.Remove(tmp)
-	tf, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
+		return fail(err)
 	}
 	if _, err := tf.WriteAt(block, 0); err != nil {
-		tf.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if _, err := tf.WriteAt(logBytes, int64(hdr.CommitLogStart)); err != nil {
-		tf.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if _, err := tf.WriteAt(data.Bytes(), int64(hdr.DataStart)); err != nil {
-		tf.Close()
-		os.Remove(tmp)
-		return err
+		return fail(err)
 	}
 	if err := tf.Sync(); err != nil {
-		tf.Close()
-		os.Remove(tmp)
-		return err
+		return fail(err)
 	}
-	old := db.f
 	if err := tf.Close(); err != nil {
 		os.Remove(tmp)
 		return err
@@ -1337,11 +1720,86 @@ func (db *DB) checkpointLocked() error {
 	if err != nil {
 		return err
 	}
-	old.Close()
+	newGen := &fileGen{f: nf, wide: true, cache: db.cache}
+	oldGen := db.gen
+	oldFile := db.f
+	if db.cache == nil {
+		db.cache = newPageCache(DefaultCacheBytes)
+		newGen.cache = db.cache
+	}
+	if oldGen != nil {
+		db.cache.dropGen(oldGen)
+		// The previous inode stays readable for snapshots that still point
+		// at it. The finalizer closes that fd once those snapshots are gone.
+		runtime.SetFinalizer(oldGen, func(g *fileGen) { g.close() })
+	} else if oldFile != nil {
+		oldFile.Close()
+	}
+	db.gen = newGen
 	db.f = nf
+	hdr.Layers = cloneLayers(hdr.Layers)
 	db.hdr = &hdr
 	db.journalOff = hdr.JournalStart
+
+	next := make(map[string]*Snapshot, len(st.branches))
+	for _, branch := range branchNames {
+		old := st.branches[branch]
+		if old == nil {
+			continue
+		}
+		layers := make(map[int]*layerState, len(metas[branch]))
+		for height, lm := range metas[branch] {
+			ls := newLayerState()
+			ls.nextSlot = lm.nextSlot
+			ls.count = lm.count
+			ls.idIndex = lm.idIndex
+			if lm.indexes != nil {
+				ls.indexes = lm.indexes
+			}
+			if len(lm.refs) > 0 {
+				ls.disk = &diskLayer{gen: newGen, branch: branch, layer: height, refs: lm.refs}
+			}
+			layers[height] = ls
+		}
+		next[branch] = &Snapshot{
+			Branch:     branch,
+			Commit:     old.Commit,
+			matrixView: matrixView{hdr: db.hdr, layers: layers},
+		}
+	}
+	db.state.Store(&dbState{branches: next})
 	return nil
+}
+
+// exportLayer copies the id index and flattens secondary indexes so the
+// published disk head does not share maps with the snapshot being checkpointed.
+func exportLayer(l *layerState, height int) *layerMeta {
+	m := l.materialize()
+	if m == nil {
+		m = l
+	}
+	idIndex := make(map[uint64]uint64, len(m.idIndex))
+	for k, v := range m.idIndex {
+		idIndex[k] = v
+	}
+	return &layerMeta{
+		height:   height,
+		nextSlot: m.nextSlot,
+		count:    m.count,
+		refs:     map[uint64]pageLoc{},
+		idIndex:  idIndex,
+		indexes:  flattenIndexMap(l),
+	}
+}
+
+func cloneLayers(in map[int]Layer) map[int]Layer {
+	out := make(map[int]Layer, len(in))
+	for k, v := range in {
+		v.Attrs = append([]string(nil), v.Attrs...)
+		v.Indexed = append([]string(nil), v.Indexed...)
+		out[k] = v
+	}
+	return out
 }
 
 // Close checkpoints the database (only if the journal holds records since
@@ -1364,10 +1822,111 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	db.closed = true
 	db.mu.Unlock()
+	if db.gen != nil && db.gen.f == db.f {
+		db.gen.f = nil
+	}
 	if cerr := db.f.Close(); err == nil {
 		err = cerr
 	}
 	return err
+}
+
+// SetCacheLimit caps decoded slotted pages. The id index and secondary
+// indexes stay resident. n <= 0 restores the default budget.
+func (db *DB) SetCacheLimit(n int) {
+	if db.cache == nil {
+		db.cache = newPageCache(n)
+		if db.gen != nil {
+			db.gen.cache = db.cache
+		}
+		return
+	}
+	db.cache.setMax(n)
+	if db.gen != nil && db.gen.cache == nil {
+		db.gen.cache = db.cache
+	}
+}
+
+// PageLoads reports how many slotted pages have been decoded from disk
+// since this file generation was opened. A checkpoint starts a new count.
+func (db *DB) PageLoads() uint64 {
+	if db.gen == nil {
+		return 0
+	}
+	return db.gen.loads.Load()
+}
+
+// CreateIndex declares a hash index on an existing attribute and checkpoints
+// so the index survives reopen. It is idempotent. In-flight write
+// transactions conflict and must retry, because the published head changes
+// under them without a new commit id.
+func (db *DB) CreateIndex(layerName, attr string) error {
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
+	db.mu.RLock()
+	closed := db.closed
+	db.mu.RUnlock()
+	if closed {
+		return errors.New("engine: database is closed")
+	}
+	def, ok := db.hdr.LayerByName(layerName)
+	if !ok {
+		return fmt.Errorf("engine: unknown layer %q", layerName)
+	}
+	pos, ok := def.AttrIndex(attr)
+	if !ok {
+		return fmt.Errorf("engine: layer %q has no attribute %q", layerName, attr)
+	}
+	canon := def.Attrs[pos]
+	if def.IsIndexed(canon) {
+		return nil
+	}
+
+	layers := cloneLayers(db.hdr.Layers)
+	l := layers[def.Height]
+	l.Indexed = append(l.Indexed, canon)
+	layers[def.Height] = l
+	hdr := *db.hdr
+	hdr.Layers = layers
+	newHdr := &hdr
+
+	st := db.state.Load()
+	next := cloneRefs(st.branches)
+	for branch, snap := range st.branches {
+		copied := make(map[int]*layerState, len(snap.layers)+1)
+		for h, ls := range snap.layers {
+			copied[h] = ls
+		}
+		base := copied[def.Height]
+		if base == nil {
+			base = newLayerState()
+		}
+		ov := base.overlay()
+		ix := newAttrIndex()
+		snap.Walk(def.Height, false, func(r *Record) bool {
+			if pos < len(r.Attrs) {
+				ix.add(r.Attrs[pos], r.ID)
+			}
+			return true
+		})
+		if err := snap.ReadErr(); err != nil {
+			return err
+		}
+		if ov.indexes == nil {
+			ov.indexes = map[string]*attrIndex{}
+		}
+		ov.indexes[canon] = ix
+		copied[def.Height] = ov
+		next[branch] = &Snapshot{
+			Branch:     branch,
+			Commit:     snap.Commit,
+			matrixView: matrixView{hdr: newHdr, layers: copied},
+		}
+	}
+	db.epoch.Add(1)
+	db.hdr = newHdr
+	db.state.Store(&dbState{branches: next})
+	return db.checkpointLocked()
 }
 
 // splitFork splits a fork reference "branch@commit".

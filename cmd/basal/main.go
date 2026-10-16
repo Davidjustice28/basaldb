@@ -122,10 +122,25 @@ func parseLayersFlag(value string) ([]engine.Layer, error) {
 	return engine.ParseLayers(value)
 }
 
+func applyCacheLimit(db *engine.DB, spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return nil
+	}
+	n, err := engine.ParseByteSize(spec)
+	if err != nil {
+		return err
+	}
+	if n > int64(^uint(0)>>1) {
+		return fmt.Errorf("basal: -max-memory %q is too large", spec)
+	}
+	db.SetCacheLimit(int(n))
+	return nil
+}
+
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	file := fs.String("file", "", "path of the .bsl container to create (default: 'basal config set file', else ./basal.bsl)")
-	layers := fs.String("layers", "Accounts,Teams,Users", "layer definitions; optional attribute names enable symbolic BQL (\"0:Accounts(name,date),1:Teams(name)\")")
+	layers := fs.String("layers", "Accounts,Teams,Users", "layer definitions; optional attribute names enable symbolic BQL (\"0:Accounts(name,date),1:Teams(name)\"). A trailing ! (url!) declares an equality hash index")
 	author := fs.String("author", "basal <basal@localhost>", "Author of the initialization commit")
 	summary := fs.String("summary", "Database initialized", "Summary of the initialization commit")
 	reason := fs.String("reason", "manual initialization", "Reason of the initialization commit")
@@ -155,6 +170,7 @@ func cmdInspect(args []string) error {
 	branch := fs.String("branch", "", "branch to inspect (default: 'basal config set branch', else main)")
 	header := fs.Bool("header", false, "print the raw ASCII header block")
 	asJSON := fs.Bool("json", false, "print JSON")
+	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). Does not cap the id index")
 	_ = fs.Parse(args)
 	path, err := config.ResolveFile(*file)
 	if err != nil {
@@ -169,6 +185,9 @@ func cmdInspect(args []string) error {
 		return err
 	}
 	defer db.Close()
+	if err := applyCacheLimit(db, *maxMem); err != nil {
+		return err
+	}
 
 	if *header {
 		block, err := db.Header().Marshal()
@@ -311,6 +330,7 @@ func cmdQuery(args []string) error {
 	reason := fs.String("reason", "", "stamps the commit block (required for BRANCH CREATE)")
 	format := fs.String("format", "table", "output format: table, csv, tsv or json (-json is an alias for -format json)")
 	asJSON := fs.Bool("json", false, "print JSON (alias for -format json)")
+	maxMem := fs.String("max-memory", "", "page cache budget, for example 256MB (default 64MB). Does not cap the id index")
 	flagArgs, posArgs := splitArgs(args, map[string]bool{"json": true})
 	_ = fs.Parse(flagArgs)
 	if len(posArgs) != 1 {
@@ -337,6 +357,9 @@ func cmdQuery(args []string) error {
 		return err
 	}
 	defer db.Close()
+	if err := applyCacheLimit(db, *maxMem); err != nil {
+		return err
+	}
 
 	ctx := &bql.ExecContext{
 		DB:     db,

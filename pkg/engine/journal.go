@@ -12,8 +12,12 @@ import (
 //	u32 magic "JLOG" | u32 payloadLen | payload
 const (
 	journalMagic  uint32 = 0x4A4C4F47 // "JLOG"
-	journalCommit byte   = 1
+	journalCommit byte   = 1          // v1.0 tuples: uint16 lengths
 	journalBranch byte   = 2
+	// journalCommitWide is a v1.1 commit frame. Attribute and child-list
+	// lengths are uint32, so a long value cannot truncate on the way to
+	// disk (issue #44). Kind 1 frames stay readable.
+	journalCommitWide byte = 3
 )
 
 type journalRecord struct {
@@ -22,11 +26,28 @@ type journalRecord struct {
 	ops    []Op
 }
 
-func marshalJournalCommit(c *Commit, ops []Op) []byte {
+func marshalJournalCommit(c *Commit, ops []Op) ([]byte, error) {
+	opsBytes, err := marshalOps(ops, true)
+	if err != nil {
+		return nil, err
+	}
+	payload := []byte{journalCommitWide}
+	payload = appendU32Bytes(payload, []byte(c.Text()))
+	payload = appendU32Bytes(payload, opsBytes)
+	return frameJournal(payload), nil
+}
+
+// marshalJournalCommitV10 writes a v1.0 commit frame. Tests use it to
+// build a file this engine must still open.
+func marshalJournalCommitV10(c *Commit, ops []Op) ([]byte, error) {
+	opsBytes, err := marshalOps(ops, false)
+	if err != nil {
+		return nil, err
+	}
 	payload := []byte{journalCommit}
 	payload = appendU32Bytes(payload, []byte(c.Text()))
-	payload = appendU32Bytes(payload, marshalOps(ops))
-	return frameJournal(payload)
+	payload = appendU32Bytes(payload, opsBytes)
+	return frameJournal(payload), nil
 }
 
 func marshalJournalBranch(ev *BranchEvent) []byte {
@@ -65,7 +86,7 @@ func appendU32Bytes(dst, b []byte) []byte {
 //
 //	opCreate/opUpdate: u8 kind | i32 layer | record tuple
 //	opDelete:          u8 kind | i32 layer | u64 id
-func marshalOps(ops []Op) []byte {
+func marshalOps(ops []Op, wide bool) ([]byte, error) {
 	var b []byte
 	for _, op := range ops {
 		b = append(b, op.Kind)
@@ -74,16 +95,20 @@ func marshalOps(ops []Op) []byte {
 		b = append(b, tmp[0:4]...)
 		switch op.Kind {
 		case opCreate, opUpdate:
-			b = appendU32Bytes(b, encodeRecord(op.Record))
+			rec, err := encodeRecord(op.Record, wide)
+			if err != nil {
+				return nil, err
+			}
+			b = appendU32Bytes(b, rec)
 		case opDelete:
 			binary.LittleEndian.PutUint64(tmp[:], op.ID)
 			b = append(b, tmp[:]...)
 		}
 	}
-	return b
+	return b, nil
 }
 
-func parseOps(b []byte) ([]Op, error) {
+func parseOps(b []byte, wide bool) ([]Op, error) {
 	var ops []Op
 	for off := 0; off < len(b); {
 		kind := b[off]
@@ -104,7 +129,7 @@ func parseOps(b []byte) ([]Op, error) {
 			if n <= 0 || len(b)-off < n {
 				return nil, fmt.Errorf("engine: truncated journal record payload")
 			}
-			rec, err := decodeRecord(b[off : off+n])
+			rec, err := decodeRecord(b[off:off+n], wide)
 			if err != nil {
 				return nil, err
 			}
@@ -144,7 +169,7 @@ func parseJournal(data []byte) ([]journalRecord, error) {
 
 		rec := journalRecord{}
 		switch payload[0] {
-		case journalCommit:
+		case journalCommit, journalCommitWide:
 			p := payload[1:]
 			text, rest, err := takeU32Bytes(p)
 			if err != nil {
@@ -162,7 +187,7 @@ func parseJournal(data []byte) ([]journalRecord, error) {
 			if err != nil {
 				return nil, err
 			}
-			ops, err := parseOps(opsBytes)
+			ops, err := parseOps(opsBytes, payload[0] == journalCommitWide)
 			if err != nil {
 				return nil, err
 			}

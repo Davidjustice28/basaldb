@@ -159,17 +159,36 @@ func TestPageUnmarshalCorrupted(t *testing.T) {
 
 func TestRecordCodecRoundTrip(t *testing.T) {
 	r := rec(42, 7, 3, []uint64{1, 2, 3}, "a", "b:c", "")
-	got, err := decodeRecord(encodeRecord(r))
+	enc, err := encodeRecord(r, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeRecord(enc, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.ID != r.ID || got.Slot != r.Slot || got.Parent != r.Parent {
 		t.Fatalf("identity mismatch: %+v", got)
 	}
-	if !bytes.Equal(encodeRecord(got), encodeRecord(r)) {
+	again, err := encodeRecord(got, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, enc) {
 		t.Fatal("re-encoding mismatch")
 	}
-	if _, err := decodeRecord([]byte{1, 2, 3}); !errors.Is(err, ErrCorruptPage) {
+	narrow, err := encodeRecord(r, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = decodeRecord(narrow, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != r.ID || len(got.Attrs) != len(r.Attrs) {
+		t.Fatalf("narrow identity mismatch: %+v", got)
+	}
+	if _, err := decodeRecord([]byte{1, 2, 3}, true); !errors.Is(err, ErrCorruptPage) {
 		t.Fatalf("truncated record err = %v", err)
 	}
 }

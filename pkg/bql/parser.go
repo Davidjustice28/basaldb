@@ -193,12 +193,25 @@ type BranchStmt struct {
 	From   string
 }
 
-func (*GetStmt) statementNode()    {}
-func (*CreateStmt) statementNode() {}
-func (*UpdateStmt) statementNode() {}
-func (*DeleteStmt) statementNode() {}
-func (*ShowStmt) statementNode()   {}
-func (*BranchStmt) statementNode() {}
+func (*GetStmt) statementNode()         {}
+func (*CreateStmt) statementNode()      {}
+func (*CreateIndexStmt) statementNode() {}
+func (*UpdateStmt) statementNode()      {}
+func (*DeleteStmt) statementNode()      {}
+func (*ShowStmt) statementNode()        {}
+func (*BranchStmt) statementNode()      {}
+
+// CreateIndexStmt declares a hash index on one existing attribute:
+//
+//	CREATE INDEX ON Pages(url)
+//
+// The attribute must already be declared on the layer. Repeating the
+// statement is a no-op. Equality filters on that attribute then use the
+// index; range filters still scan.
+type CreateIndexStmt struct {
+	Layer string
+	Attr  string
+}
 
 type parser struct {
 	toks []token
@@ -255,6 +268,9 @@ func (p *parser) parseStmt() (Statement, error) {
 		return p.parseGet()
 	case keyword(t, "CREATE"):
 		p.next()
+		if keyword(p.peek(), "INDEX") {
+			return p.parseCreateIndex()
+		}
 		return p.parseCreate()
 	case keyword(t, "UPDATE"):
 		p.next()
@@ -785,6 +801,35 @@ func (p *parser) parseCreateParentRef() (RecordRef, error) {
 		ref.Filters = fs
 	}
 	return ref, nil
+}
+
+// parseCreateIndex parses CREATE INDEX ON Layer(attr).
+func (p *parser) parseCreateIndex() (Statement, error) {
+	if _, err := p.expect(tokIdent, "INDEX"); err != nil {
+		return nil, err
+	}
+	on, err := p.expect(tokIdent, "ON")
+	if err != nil {
+		return nil, err
+	}
+	if !keyword(on, "ON") {
+		return nil, fmt.Errorf("bql: expected ON, got %s", on.text)
+	}
+	layer, err := p.expect(tokIdent, "layer name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tokLParen, "("); err != nil {
+		return nil, err
+	}
+	attr, err := p.expect(tokIdent, "attribute name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tokRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &CreateIndexStmt{Layer: layer.text, Attr: attr.text}, nil
 }
 
 func (p *parser) parseCreate() (Statement, error) {

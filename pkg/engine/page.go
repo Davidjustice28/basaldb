@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 )
 
@@ -172,6 +173,28 @@ func (p *Page) Slots() []*Record {
 	return out
 }
 
+// visit calls fn for each valid record. reverse walks the page from the
+// high slot down, which is descending id order within a layer. The walk
+// stops when fn returns false.
+func (p *Page) visit(reverse bool, fn func(*Record) bool) bool {
+	if p == nil {
+		return true
+	}
+	i, step := 0, 1
+	if reverse {
+		i, step = SlotsPerPage-1, -1
+	}
+	for n := 0; n < SlotsPerPage; n++ {
+		if p.valid[i/64]&(1<<uint(i%64)) != 0 && p.slots[i] != nil {
+			if !fn(p.slots[i]) {
+				return false
+			}
+		}
+		i += step
+	}
+	return true
+}
+
 // Clone returns a deep copy of the page (copy-on-write helper).
 func (p *Page) Clone() *Page {
 	c := &Page{Layer: p.Layer, SlotBase: p.SlotBase}
@@ -187,6 +210,10 @@ func (p *Page) Clone() *Page {
 // The slot directory holds (slotIdx u16, tupleLen u32) pairs in ascending
 // slot order; tuples follow immediately after.
 func (p *Page) MarshalBinary() ([]byte, error) {
+	return p.marshalBinary(true)
+}
+
+func (p *Page) marshalBinary(wide bool) ([]byte, error) {
 	type entry struct {
 		idx  int
 		data []byte
@@ -200,7 +227,11 @@ func (p *Page) MarshalBinary() ([]byte, error) {
 		if rec == nil {
 			return nil, fmt.Errorf("%w: valid slot %d has no tuple", ErrCorruptPage, p.SlotBase+uint64(i))
 		}
-		entries = append(entries, entry{idx: i, data: encodeRecord(rec)})
+		data, err := encodeRecord(rec, wide)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry{idx: i, data: data})
 	}
 
 	size := pageFixedHead + pageWords*8 + len(entries)*6
@@ -229,8 +260,15 @@ func (p *Page) MarshalBinary() ([]byte, error) {
 	return buf, nil
 }
 
-// UnmarshalPage decodes a slotted page produced by MarshalBinary.
+// UnmarshalPage decodes a slotted page produced by MarshalBinary (v1.1
+// wide tuples). v1.0 pages are decoded by unmarshalPage with wide=false.
 func UnmarshalPage(buf []byte) (*Page, error) {
+	return unmarshalPage(buf, true)
+}
+
+// unmarshalPage decodes a slotted page. wide selects the v1.1 tuple
+// layout (uint32 lengths); v1.0 pages use uint16 lengths.
+func unmarshalPage(buf []byte, wide bool) (*Page, error) {
 	if len(buf) < pageFixedHead+pageWords*8 {
 		return nil, fmt.Errorf("%w: page too short (%d bytes)", ErrCorruptPage, len(buf))
 	}
@@ -280,7 +318,7 @@ func UnmarshalPage(buf []byte) (*Page, error) {
 		if tupleLen <= 0 || len(buf) < off+tupleLen {
 			return nil, fmt.Errorf("%w: truncated tuple at slot %d", ErrCorruptPage, idx)
 		}
-		rec, err := decodeRecord(buf[off : off+tupleLen])
+		rec, err := decodeRecord(buf[off:off+tupleLen], wide)
 		if err != nil {
 			return nil, err
 		}
@@ -296,14 +334,25 @@ func UnmarshalPage(buf []byte) (*Page, error) {
 	return p, nil
 }
 
-// encodeRecord serializes one record tuple:
+// encodeRecord serializes one record tuple.
 //
-//	id(8) slot(8) parent(8) nChildren(2) children(8*) nAttrs(2) attrs(2+len*)
-func encodeRecord(r *Record) []byte {
+// v1.1 (wide): id(8) slot(8) parent(8) nChildren(4) children(8*) nAttrs(4) attrs(4+len*)
+// v1.0:        the three length fields are uint16. Callers must not pass a
+// record that does not fit; this returns an error instead of truncating,
+// which is what used to make the file unopenable (issue #44).
+func encodeRecord(r *Record, wide bool) ([]byte, error) {
+	if err := recordFits(r, wide); err != nil {
+		return nil, err
+	}
 	var b bytes.Buffer
 	writeU64 := func(v uint64) {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.Write(tmp[:])
+	}
+	writeU32 := func(v uint32) {
+		var tmp [4]byte
+		binary.LittleEndian.PutUint32(tmp[:], v)
 		b.Write(tmp[:])
 	}
 	writeU16 := func(v uint16) {
@@ -311,22 +360,49 @@ func encodeRecord(r *Record) []byte {
 		binary.LittleEndian.PutUint16(tmp[:], v)
 		b.Write(tmp[:])
 	}
+	writeCount := func(n int) {
+		if wide {
+			writeU32(uint32(n))
+			return
+		}
+		writeU16(uint16(n))
+	}
 	writeU64(r.ID)
 	writeU64(r.Slot)
 	writeU64(r.Parent)
-	writeU16(uint16(len(r.Children)))
+	writeCount(len(r.Children))
 	for _, c := range r.Children {
 		writeU64(c)
 	}
-	writeU16(uint16(len(r.Attrs)))
+	writeCount(len(r.Attrs))
 	for _, a := range r.Attrs {
-		writeU16(uint16(len(a)))
+		writeCount(len(a))
 		b.WriteString(a)
 	}
-	return b.Bytes()
+	return b.Bytes(), nil
 }
 
-func decodeRecord(b []byte) (*Record, error) {
+// recordFits reports whether every length in r fits the tuple width.
+func recordFits(r *Record, wide bool) error {
+	limit := uint64(math.MaxUint32)
+	if !wide {
+		limit = math.MaxUint16
+	}
+	if uint64(len(r.Children)) > limit {
+		return fmt.Errorf("engine: record %d has %d children, max %d", r.ID, len(r.Children), limit)
+	}
+	if uint64(len(r.Attrs)) > limit {
+		return fmt.Errorf("engine: record %d has %d attributes, max %d", r.ID, len(r.Attrs), limit)
+	}
+	for i, a := range r.Attrs {
+		if uint64(len(a)) > limit {
+			return fmt.Errorf("engine: attribute %d of record %d is %d bytes, max %d", i, r.ID, len(a), limit)
+		}
+	}
+	return nil
+}
+
+func decodeRecord(b []byte, wide bool) (*Record, error) {
 	r := &Record{}
 	rd := bytes.NewReader(b)
 	readU64 := func(dst *uint64) error {
@@ -337,13 +413,19 @@ func decodeRecord(b []byte) (*Record, error) {
 		*dst = binary.LittleEndian.Uint64(tmp[:])
 		return nil
 	}
-	readU16 := func(dst *uint16) error {
+	readCount := func() (uint64, error) {
+		if wide {
+			var tmp [4]byte
+			if _, err := io.ReadFull(rd, tmp[:]); err != nil {
+				return 0, fmt.Errorf("%w: truncated record: %v", ErrCorruptPage, err)
+			}
+			return uint64(binary.LittleEndian.Uint32(tmp[:])), nil
+		}
 		var tmp [2]byte
 		if _, err := io.ReadFull(rd, tmp[:]); err != nil {
-			return fmt.Errorf("%w: truncated record: %v", ErrCorruptPage, err)
+			return 0, fmt.Errorf("%w: truncated record: %v", ErrCorruptPage, err)
 		}
-		*dst = binary.LittleEndian.Uint16(tmp[:])
-		return nil
+		return uint64(binary.LittleEndian.Uint16(tmp[:])), nil
 	}
 	if err := readU64(&r.ID); err != nil {
 		return nil, err
@@ -354,25 +436,39 @@ func decodeRecord(b []byte) (*Record, error) {
 	if err := readU64(&r.Parent); err != nil {
 		return nil, err
 	}
-	var n uint16
-	if err := readU16(&n); err != nil {
+	nChild, err := readCount()
+	if err != nil {
 		return nil, err
 	}
-	r.Children = make([]uint64, n)
+	// Reject a count that cannot fit in the bytes still unread before
+	// allocating. Each child is 8 bytes.
+	if nChild > uint64(rd.Len()/8) {
+		return nil, fmt.Errorf("%w: child count %d exceeds record", ErrCorruptPage, nChild)
+	}
+	r.Children = make([]uint64, nChild)
 	for i := range r.Children {
 		if err := readU64(&r.Children[i]); err != nil {
 			return nil, err
 		}
 	}
-	if err := readU16(&n); err != nil {
+	nAttr, err := readCount()
+	if err != nil {
 		return nil, err
 	}
-	r.Attrs = make([]string, n)
+	minAttr := 2
+	if wide {
+		minAttr = 4
+	}
+	if minAttr > 0 && nAttr > uint64(rd.Len()/minAttr) {
+		return nil, fmt.Errorf("%w: attribute count %d exceeds record", ErrCorruptPage, nAttr)
+	}
+	r.Attrs = make([]string, nAttr)
 	for i := range r.Attrs {
-		if err := readU16(&n); err != nil {
+		n, err := readCount()
+		if err != nil {
 			return nil, err
 		}
-		if rd.Len() < int(n) {
+		if uint64(rd.Len()) < n {
 			return nil, fmt.Errorf("%w: truncated attribute", ErrCorruptPage)
 		}
 		tmp := make([]byte, n)

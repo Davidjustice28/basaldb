@@ -36,7 +36,8 @@ basal query 'GET Accounts[name="Acme"] -> Teams -> Users'  # walk down
 basal query 'GET Users[name,email][role=admin]'            # columns + filter
 basal query 'GET Users[*][id=(gt=10)][limit=5,sort=desc]'  # compare, limit, sort
 basal query 'SHOW RECORDS Users'
-basal query 'SHOW SCHEMA'
+basal query 'CREATE INDEX ON Users(email)'                # equality hash index
+basal query 'SHOW SCHEMA'                                  # indexed names end with !
 basal query -json 'GET Users'
 basal query -format csv 'GET Users[name,email]'
 
@@ -62,7 +63,7 @@ basal inspect -header
 |---|---|
 | **Container** | One `.bsl` file. It holds the layers, records, branches and the commit log. |
 | **Layer** | One level of the hierarchy, with a height: `0:Accounts` is the root, `1:Teams` sits under it, `2:Users` under that. Fixed at `init`. |
-| **Attributes** | Each record stores an ordered list of **string** values. If you declare names at init (`Users(name,email)`), you can use `name=` / `[name,email]`; otherwise use positions (`0=`, `[0,1]`). Names are case-insensitive. |
+| **Attributes** | Each record stores an ordered list of **string** values. If you declare names at init (`Users(name,email)`), you can use `name=` / `[name,email]`; otherwise use positions (`0=`, `[0,1]`). Names are case-insensitive. A trailing `!` (`email!`) builds a hash index for `email=` equality. `CREATE INDEX ON Users(email)` adds one later. |
 | **Record** | Has an `id` (unique across the file), a `slot` (its position within its layer), a `parent` id (`0` for roots) and a list of `children` ids. |
 | **Branch** | An isolated fork of the data, starting from another branch's current state. Default: `main`. |
 | **Commit** | Every write appends one commit to the log: branch, parent commit, timestamp, the operations, and optional `author` / `summary` / `reason`. |
@@ -210,7 +211,7 @@ commits:
 ```console
 $ basal inspect -header
 Magic:BSL
-Version:1.0
+Version:1.1
 Format:MatrixSlottedPage
 Layers:[0:Accounts(name,plan), 1:Teams(name), 2:Users(name,email,role,age)]
 Branches:cleanup,main
@@ -453,9 +454,15 @@ height | layer | attributes
 ```
 
 `SHOW SCHEMA` reports the attribute names declared at `init`, so you don't
-have to provoke an error to find them. A layer that declares none shows an
-empty attribute list (use positional `0=`, `[0,1]` instead). `timestamp` is
-in Unix seconds.
+have to provoke an error to find them. Indexed names keep a trailing `!`
+(`email!`). A layer that declares none shows an empty attribute list (use
+positional `0=`, `[0,1]` instead). `CREATE INDEX ON Layer(attr)` adds an
+equality hash index to an existing attribute and checkpoints. `timestamp`
+is in Unix seconds.
+
+`basal query` and `basal inspect` take `-max-memory 256MB` (also `basald`)
+to cap the decoded page cache. The default is 64MB. The id index is not
+part of that cap.
 
 ### BRANCH statements
 
@@ -609,15 +616,28 @@ Common errors:
 doesn't exist.
 
 ```console
-$ basald -file acme.bsl -addr :8080 [-layers "…"] [-sync]
+$ basald -file acme.bsl [-layers "…"]
+# 127.0.0.1:8080, fsync on. A public bind needs a token:
+
+$ BASAL_TOKEN="$(openssl rand -hex 32)" basald -file acme.bsl -addr 0.0.0.0:8080
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-file` | `basal.bsl` | container |
-| `-addr` | `:8080` (or `$PORT`) | listen address |
+| `-addr` | `127.0.0.1:8080` | listen address. `0.0.0.0:8080` or `:8080` binds every interface. If you leave `-addr` unset and `PORT` is set (Cloud Run), basald binds `0.0.0.0:$PORT` |
 | `-layers` | `Accounts,Teams,Users` | used only when creating a new file |
-| `-sync` | off | fsync every commit (slower, safer) |
+| `-sync` | on | fsync every commit before the response. `-sync=false` acknowledges the write before it hits disk |
+| `-token-env` | `BASAL_TOKEN` | name of the env var that holds the bearer token. The token is not a flag, so it stays out of `ps` |
+| `-read-token-env` | unset | env var for a token that may only call GET routes. Writes get `403` |
+| `-insecure-no-auth` | off | allow a non-loopback listen with no token |
+| `-tls-cert`, `-tls-key` | unset | serve HTTPS. On a public bind without these, put TLS in front of basald |
+
+`Authorization: Bearer <token>` is required on every route except
+`/v1/health` once a token is configured. A non-loopback listen with no
+token refuses to start. Concurrent `POST /v1/execute` calls on the same
+branch are queued in the server, so clients do not see `409 Conflict`
+for overlapping single statements.
 
 | Endpoint | Method | Use |
 |---|---|---|
@@ -639,7 +659,7 @@ $ curl 'localhost:8080/v1/commits?branch=main'
 [{"kind":"commit","id":13,"branch":"main","author":"Alex <alex@acme.io>", … ,"ops":["UPDATE Users#0 id=6"]}, …]
 ```
 
-Errors come back as `{"error":"…"}` with status `400` / `405`. Don't run
+Errors come back as `{"error":"…"}` with status `400` / `401` / `403` / `405` / `409` / `413`. Don't run
 CLI writes against a file while `basald` is serving it
 ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 
@@ -655,6 +675,6 @@ Current gaps, with tracking issues:
 - **Sort/paging:** id only, no offset (#11); no COUNT (#12)
 - **Paths:** downward only, no skipping layers, leaf columns only (#13, #14, #3)
 - **Records:** can't change parent (#15); orphans possible (#5)
-- **Schema:** strings only, fixed at init (#16, #17, #29, #30, #18)
+- **Schema:** strings only, fixed at init except `CREATE INDEX` (#16, #17, #29, #30, #18). `-max-memory` (query, inspect, basald) caps the page cache, not the id index.
 - **Branches:** no delete/diff/merge (#19, #20); no time travel (#21)
 - **Tooling:** no export/import, verify, compact, version, CSV (#24, #25, #26, #27, #28), no interactive shell (#23)

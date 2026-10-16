@@ -3,23 +3,43 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"basaldb/pkg/bql"
 	"basaldb/pkg/engine"
 )
 
+// maxRequestBytes caps a POST body so one client cannot force the process
+// to buffer an unbounded payload. 32 MiB still fits a large attribute.
+const maxRequestBytes = 32 << 20
+
 // Server exposes a *engine.DB over HTTP/JSON.
 type Server struct {
-	db *engine.DB
+	db        *engine.DB
+	token     string
+	readToken string
+	locks     sync.Map // branch name -> *sync.Mutex
 }
 
 // NewServer wraps a database in the REST API.
 func NewServer(db *engine.DB) *Server { return &Server{db: db} }
+
+// SetAuth requires a bearer token on every route except /v1/health.
+// readToken, when set, may call the read-only routes and receives 403
+// on writes. Empty token and readToken leave the API open, which is
+// safe only on a loopback listen; basald refuses a public bind without
+// a token unless -insecure-no-auth is set.
+func (s *Server) SetAuth(token, readToken string) {
+	s.token = token
+	s.readToken = readToken
+}
 
 // Handler returns the routed http.Handler for the /v1 API.
 func (s *Server) Handler() http.Handler {
@@ -30,7 +50,81 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/execute", s.handleExecute)
 	mux.HandleFunc("/v1/branches", s.handleBranches)
 	mux.HandleFunc("/v1/commits", s.handleCommits)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := s.authorize(r); err != nil {
+			status := http.StatusUnauthorized
+			if errors.Is(err, errReadOnly) {
+				status = http.StatusForbidden
+			}
+			writeErr(w, status, err)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+var errReadOnly = errors.New("read-only token")
+
+func (s *Server) authorize(r *http.Request) error {
+	if r.URL.Path == "/v1/health" || (s.token == "" && s.readToken == "") {
+		return nil
+	}
+	got := bearerToken(r)
+	if s.token != "" && tokenMatch(got, s.token) {
+		return nil
+	}
+	if s.readToken != "" && tokenMatch(got, s.readToken) {
+		if readOnlyRequest(r) {
+			return nil
+		}
+		return errReadOnly
+	}
+	return errors.New("unauthorized")
+}
+
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// tokenMatch compares tokens in constant time. Hashing both sides first
+// keeps the compare independent of the secret's length.
+func tokenMatch(got, want string) bool {
+	if want == "" {
+		return false
+	}
+	g := sha256.Sum256([]byte(got))
+	w := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(g[:], w[:]) == 1
+}
+
+func readOnlyRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	switch r.URL.Path {
+	case "/v1/query", "/v1/meta", "/v1/branches", "/v1/commits", "/v1/health":
+		return true
+	}
+	return false
+}
+
+// lockBranch serializes writers on one branch for the duration of a
+// single statement. basald is the process that owns the file, so it can
+// queue commits instead of returning 409 when two requests overlap
+// (issue #47). Different branches do not block each other.
+func (s *Server) lockBranch(branch string) func() {
+	if branch == "" {
+		branch = engine.DefaultBranch
+	}
+	v, _ := s.locks.LoadOrStore(branch, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 type errorBody struct {
@@ -129,9 +223,10 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, errors.New("POST only"))
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	var body executeBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeRequestErr(w, err)
 		return
 	}
 	if strings.TrimSpace(body.Statement) == "" {
@@ -144,7 +239,13 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	res, err := bql.ExecStmt(s.execContext(r, meta), stmt)
+	ctx := s.execContext(r, meta)
+	if body.Branch != "" && r.URL.Query().Get("branch") == "" && r.Header.Get("X-Basal-Branch") == "" {
+		ctx.Branch = body.Branch
+	}
+	unlock := s.lockBranch(ctx.Branch)
+	defer unlock()
+	res, err := bql.ExecStmt(ctx, stmt)
 	if err != nil {
 		writeErr(w, statusFor(err), err)
 		return
@@ -168,13 +269,17 @@ func (s *Server) handleBranches(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.db.Branches())
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		var body branchBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeRequestErr(w, err)
 			return
 		}
 		meta := engine.TxMeta{Author: body.Author, Summary: body.Summary, Reason: body.Reason}
-		if err := s.db.CreateBranch(body.Name, body.ForkFrom, meta); err != nil {
+		unlock := s.lockBranch(body.Name)
+		defer unlock()
+		err := s.db.CreateBranch(body.Name, body.ForkFrom, meta)
+		if err != nil {
 			writeErr(w, statusFor(err), err)
 			return
 		}
@@ -239,6 +344,15 @@ func branchParam(r *http.Request) string {
 		return b
 	}
 	return engine.DefaultBranch
+}
+
+func writeRequestErr(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeErr(w, http.StatusRequestEntityTooLarge, errors.New("request body too large"))
+		return
+	}
+	writeErr(w, http.StatusBadRequest, err)
 }
 
 func statusFor(err error) int {

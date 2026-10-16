@@ -28,6 +28,7 @@ One file holds everything, in four regions (`pkg/engine/header.go`):
 [0, 4096)                        ASCII header: Magic:BSL, version, layers, branches, region offsets
 [CommitLogStart, CommitLogEnd)   human-readable commit log (author, summary, reason, ops)
 [DataStart, DataEnd)             binary slotted pages, per branch and layer
+[IndexStart, IndexEnd)           page directory, id index, secondary hash indexes
 [JournalStart, EOF)              append-only binary journal of commits since the last checkpoint
 ```
 
@@ -37,9 +38,12 @@ One file holds everything, in four regions (`pkg/engine/header.go`):
   and rewrites the file. It runs once the journal passes 8 MiB, or on
   request. A clean close doesn't checkpoint, so read-only use leaves the
   file byte-for-byte unchanged.
-- **Open** reads the header, commit log and pages, then replays the
-  journal. Today the whole database is loaded into RAM
-  ([#37](https://github.com/Davidjustice28/basaldb/issues/37)).
+- **Open** reads the header, the commit log, and the index region, then
+  replays the journal. Page bodies stay on disk until a read misses the
+  cache. Files written before the index region existed are scanned once
+  (one page at a time) to rebuild the directory and indexes; the next
+  checkpoint stores them. `-max-memory` (default 64MB) caps the decoded
+  page cache. The id index and secondary indexes remain resident.
 
 ## Slotted pages
 
@@ -47,8 +51,10 @@ A page (`page.go`) covers 1024 consecutive slots of one layer:
 - A 1024-bit validity bitmask; deleting a record clears its bit.
 - A slot directory, then encoded record tuples:
   `id | slot | parent | nChildren | children… | nAttrs | (len, bytes)…`.
-- Length and count fields are currently `uint16`, which is the cause of
-  [#44](https://github.com/Davidjustice28/basaldb/issues/44).
+- Format 1.1 stores those lengths as `uint32` (up to 4 GiB per value,
+  up to 2^32−1 children). Format 1.0 used `uint16` and is still readable.
+  A checkpoint rewrites a 1.0 file as 1.1. A value that does not fit is
+  rejected before commit; it is never truncated.
 
 ## In memory: snapshots and copy-on-write overlays
 
@@ -61,10 +67,25 @@ head, and deep or dense overlay chains are flattened (amortized O(1) per
 commit). If another commit landed on the branch first, `Commit` fails
 with `ErrConflict` rather than overwriting it.
 
-Indexes today: per-layer `id → slot`, plus the parent/children pointers
-in each record. BQL uses them for `[id=N]`, `[slot=N]`, `[parent=N]` and
-for walking `->` paths. Lookups on other attributes scan the layer
-([#45](https://github.com/Davidjustice28/basaldb/issues/45)).
+Indexes: per-layer `id → slot`, the parent/children pointers in each
+record, and optional hash indexes on declared attributes. Declare one
+with a trailing `!` in the layer spec (`Pages(url!,status)`) or with
+`CREATE INDEX ON Pages(url)` (checkpointed immediately). BQL uses them
+for `[id=N]`, `[slot=N]`, `[parent=N]`, and `[attr=value]` when `attr`
+is indexed. Other filters scan the layer. A `GET` with `limit` stops
+an unindexed scan once enough rows match; `sort=desc` walks slots
+backward, which is descending id order within a layer. Indexed
+equality collects the matching ids (ascending) and then applies the
+remaining filters, sort, and limit. The hash index is copy-on-write,
+like the id index, and is maintained on create, update, and cascade
+delete.
+
+`basald` holds a per-branch lock across each `/v1/execute`, so
+concurrent HTTP writers on one branch queue instead of failing with
+`ErrConflict`. A direct `WriteTx` on the same branch can still see
+`ErrConflict` if another commit landed first. The daemon listens on
+localhost unless told otherwise, and refuses a public bind until a
+bearer token is configured.
 
 ## Cascade delete
 

@@ -62,6 +62,9 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 			}
 			perLayer[cur.layer] = append(perLayer[cur.layer], rec.Slot)
 			perLayerIDs[cur.layer] = append(perLayerIDs[cur.layer], rec.ID)
+			// Drop secondary-index entries while the record is still live.
+			// invalidateRange below clones the page and clears the slot.
+			e.indexRemove(cur.layer, rec)
 			deleted++
 			if cur.layer+1 > len(e.hdr.Layers)-1 && len(rec.Children) > 0 {
 				// Children must live at height+1; a missing layer means
@@ -116,6 +119,9 @@ func cascadeDelete(e *editView, layer int, id uint64) (int, error) {
 		for _, id := range perLayerIDs[height] {
 			ls.dropID(id)
 		}
+	}
+	if e.err != nil {
+		return 0, e.err
 	}
 	return deleted, nil
 }

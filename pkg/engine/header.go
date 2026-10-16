@@ -19,8 +19,13 @@ import (
 const (
 	// MagicSignature must be the first non-empty line of every .bsl file.
 	MagicSignature = "Magic:BSL"
+	// VersionV10 is the original format: record tuples store child counts,
+	// attribute counts and attribute lengths as uint16. A value past that
+	// width used to truncate and make the file unopenable (issue #44).
+	VersionV10 = "1.0"
 	// CurrentVersion is the .bsl format version written by this engine.
-	CurrentVersion = "1.0"
+	// 1.1 widens those tuple lengths to uint32. 1.0 files still open.
+	CurrentVersion = "1.1"
 	// FormatMatrixSlottedPage is the only data region format in v1.
 	FormatMatrixSlottedPage = "MatrixSlottedPage"
 	// HeaderBlockSize is the fixed size of the ASCII header region.
@@ -40,11 +45,14 @@ var (
 //
 //	Layers:[0:Accounts(name,date), 1:Teams(name)]
 //
-// Files written before attribute declarations existed simply have none.
+// A trailing '!' on an attribute name (url!) declares a hash index used
+// for equality lookups. Files written before attribute declarations
+// existed simply have none.
 type Layer struct {
-	Height int      `json:"height"`
-	Name   string   `json:"name"`
-	Attrs  []string `json:"attrs,omitempty"`
+	Height  int      `json:"height"`
+	Name    string   `json:"name"`
+	Attrs   []string `json:"attrs,omitempty"`
+	Indexed []string `json:"indexed,omitempty"` // subset of Attrs, canonical spelling
 }
 
 // AttrIndex resolves a declared attribute name to its positional
@@ -59,13 +67,65 @@ func (l Layer) AttrIndex(name string) (int, bool) {
 	return 0, false
 }
 
+// IsIndexed reports whether name is a declared hash-index attribute.
+// Matching is case-insensitive.
+func (l Layer) IsIndexed(name string) bool {
+	for _, n := range l.Indexed {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// SchemaAttrs renders declared attributes for SHOW SCHEMA. Indexed names
+// keep a trailing '!'.
+func (l Layer) SchemaAttrs() string {
+	on := map[string]bool{}
+	for _, n := range l.Indexed {
+		on[strings.ToLower(n)] = true
+	}
+	parts := make([]string, len(l.Attrs))
+	for i, a := range l.Attrs {
+		if on[strings.ToLower(a)] {
+			parts[i] = a + "!"
+		} else {
+			parts[i] = a
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// headerAttrs is the on-disk attribute list: comma-separated, no spaces,
+// with '!' on indexed names.
+func (l Layer) headerAttrs() string {
+	on := map[string]bool{}
+	for _, n := range l.Indexed {
+		on[strings.ToLower(n)] = true
+	}
+	parts := make([]string, len(l.Attrs))
+	for i, a := range l.Attrs {
+		if on[strings.ToLower(a)] {
+			parts[i] = a + "!"
+		} else {
+			parts[i] = a
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 // Header is the parsed ASCII header block of a .bsl file. It declares the
 // layer definitions (Y axis) and the byte boundaries of the file regions:
 //
 //	[0, HeaderBlockSize)                 ASCII header block
 //	[CommitLogStart, CommitLogEnd)       human-readable commit log region
 //	[DataStart, DataEnd)                 slotted binary data pages
+//	[IndexStart, IndexEnd)               page directory, id index, secondary indexes
 //	[JournalStart, EOF)                  append-only delta journal
+//
+// Files written before the index region existed omit IndexStart and
+// IndexEnd. Those parse as an empty region sitting on DataEnd, and the
+// journal still begins at JournalStart.
 type Header struct {
 	Version        string
 	Format         string
@@ -75,6 +135,8 @@ type Header struct {
 	CommitLogEnd   uint64
 	DataStart      uint64
 	DataEnd        uint64
+	IndexStart     uint64
+	IndexEnd       uint64
 	JournalStart   uint64
 }
 
@@ -163,6 +225,20 @@ func ParseHeader(block []byte) (*Header, error) {
 				return nil, fmt.Errorf("%w: bad JournalStart %q", ErrCorruptHeader, value)
 			}
 			h.JournalStart = n
+		case "IndexStart":
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("%w: bad IndexStart %q", ErrCorruptHeader, value)
+			}
+			h.IndexStart = n
+			seen["IndexStart"] = true
+		case "IndexEnd":
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("%w: bad IndexEnd %q", ErrCorruptHeader, value)
+			}
+			h.IndexEnd = n
+			seen["IndexEnd"] = true
 		default:
 			// Unknown keys are ignored for forward compatibility.
 			continue
@@ -207,7 +283,7 @@ func ParseLayers(spec string) ([]Layer, error) {
 			}
 			height, def = h, rest
 		}
-		name, attrs, err := parseLayerDef(def)
+		name, attrs, indexed, err := parseLayerDef(def)
 		if err != nil {
 			return nil, fmt.Errorf("engine: bad layer definition %q: %w", part, err)
 		}
@@ -219,7 +295,7 @@ func ParseLayers(spec string) ([]Layer, error) {
 				return nil, fmt.Errorf("engine: duplicate layer height %d", height)
 			}
 		}
-		out = append(out, Layer{Height: height, Name: name, Attrs: attrs})
+		out = append(out, Layer{Height: height, Name: name, Attrs: attrs, Indexed: indexed})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("engine: no layers given")
@@ -251,26 +327,34 @@ func splitTopLevel(s string, sep byte) []string {
 }
 
 // parseLayerDef splits "Accounts(name,date)" into its name and declared
-// attribute names.
-func parseLayerDef(def string) (string, []string, error) {
+// attribute names. A trailing '!' (url!) marks a hash index and is stored
+// separately; the attribute name itself does not include the bang.
+func parseLayerDef(def string) (string, []string, []string, error) {
 	def = strings.TrimSpace(def)
 	open := strings.IndexByte(def, '(')
 	if open < 0 {
-		return def, nil, nil
+		return def, nil, nil, nil
 	}
 	if !strings.HasSuffix(def, ")") {
-		return "", nil, fmt.Errorf("unterminated attribute list")
+		return "", nil, nil, fmt.Errorf("unterminated attribute list")
 	}
 	name := strings.TrimSpace(def[:open])
-	var attrs []string
+	var attrs, indexed []string
 	for _, a := range splitTopLevel(def[open+1:len(def)-1], ',') {
 		a = strings.TrimSpace(a)
 		if a == "" {
-			return "", nil, fmt.Errorf("empty attribute name")
+			return "", nil, nil, fmt.Errorf("empty attribute name")
+		}
+		if strings.HasSuffix(a, "!") {
+			a = strings.TrimSpace(strings.TrimSuffix(a, "!"))
+			if a == "" {
+				return "", nil, nil, fmt.Errorf("empty attribute name")
+			}
+			indexed = append(indexed, a)
 		}
 		attrs = append(attrs, a)
 	}
-	return name, attrs, nil
+	return name, attrs, indexed, nil
 }
 
 // parseLayers parses "​[0:Accounts(name,date), 1:Teams]​" into a map
@@ -295,7 +379,7 @@ func parseLayers(value string) (map[int]Layer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: malformed layer height %q", ErrCorruptHeader, heightStr)
 		}
-		name, attrs, err := parseLayerDef(def)
+		name, attrs, indexed, err := parseLayerDef(def)
 		if err != nil {
 			return nil, fmt.Errorf("%w: malformed layer entry %q: %v", ErrCorruptHeader, part, err)
 		}
@@ -305,14 +389,16 @@ func parseLayers(value string) (map[int]Layer, error) {
 		if _, dup := layers[height]; dup {
 			return nil, fmt.Errorf("%w: duplicate layer height %d", ErrCorruptHeader, height)
 		}
-		layers[height] = Layer{Height: height, Name: name, Attrs: attrs}
+		layers[height] = Layer{Height: height, Name: name, Attrs: attrs, Indexed: indexed}
 	}
 	return layers, nil
 }
 
 // Validate checks internal consistency of a parsed header.
 func (h *Header) Validate() error {
-	if h.Version != CurrentVersion {
+	switch h.Version {
+	case VersionV10, CurrentVersion:
+	default:
 		return fmt.Errorf("%w: %q", ErrUnsupportedVersion, h.Version)
 	}
 	if h.Format != FormatMatrixSlottedPage {
@@ -330,19 +416,32 @@ func (h *Header) Validate() error {
 			if strings.TrimSpace(a) == "" {
 				return fmt.Errorf("%w: empty attribute name in layer %q", ErrCorruptHeader, l.Name)
 			}
-			if seen[a] {
+			if seen[strings.ToLower(a)] {
 				return fmt.Errorf("%w: duplicate attribute %q in layer %q", ErrCorruptHeader, a, l.Name)
 			}
-			seen[a] = true
+			seen[strings.ToLower(a)] = true
 		}
+		for _, ix := range l.Indexed {
+			if _, ok := l.AttrIndex(ix); !ok {
+				return fmt.Errorf("%w: indexed attribute %q is not declared on layer %q", ErrCorruptHeader, ix, l.Name)
+			}
+		}
+	}
+	// Older files have no index region. Both offsets zero means "absent",
+	// which is an empty region at the end of the data pages.
+	if h.IndexStart == 0 && h.IndexEnd == 0 {
+		h.IndexStart = h.DataEnd
+		h.IndexEnd = h.DataEnd
 	}
 	if h.CommitLogStart < HeaderBlockSize ||
 		h.CommitLogEnd < h.CommitLogStart ||
 		h.DataStart < h.CommitLogEnd ||
 		h.DataEnd < h.DataStart ||
-		h.JournalStart < h.DataEnd {
-		return fmt.Errorf("%w: inconsistent region offsets (log %d-%d, data %d-%d, journal %d)",
-			ErrCorruptHeader, h.CommitLogStart, h.CommitLogEnd, h.DataStart, h.DataEnd, h.JournalStart)
+		h.IndexStart < h.DataEnd ||
+		h.IndexEnd < h.IndexStart ||
+		h.JournalStart < h.IndexEnd {
+		return fmt.Errorf("%w: inconsistent region offsets (log %d-%d, data %d-%d, index %d-%d, journal %d)",
+			ErrCorruptHeader, h.CommitLogStart, h.CommitLogEnd, h.DataStart, h.DataEnd, h.IndexStart, h.IndexEnd, h.JournalStart)
 	}
 	return nil
 }
@@ -364,7 +463,7 @@ func (h *Header) Marshal() ([]byte, error) {
 		l := h.Layers[height]
 		entry := fmt.Sprintf("%d:%s", height, l.Name)
 		if len(l.Attrs) > 0 {
-			entry += "(" + strings.Join(l.Attrs, ",") + ")"
+			entry += "(" + l.headerAttrs() + ")"
 		}
 		parts = append(parts, entry)
 	}
@@ -376,6 +475,8 @@ func (h *Header) Marshal() ([]byte, error) {
 	fmt.Fprintf(&b, "CommitLogEnd:%d\n", h.CommitLogEnd)
 	fmt.Fprintf(&b, "DataStart:%d\n", h.DataStart)
 	fmt.Fprintf(&b, "DataEnd:%d\n", h.DataEnd)
+	fmt.Fprintf(&b, "IndexStart:%d\n", h.IndexStart)
+	fmt.Fprintf(&b, "IndexEnd:%d\n", h.IndexEnd)
 	fmt.Fprintf(&b, "JournalStart:%d\n", h.JournalStart)
 
 	out := []byte(b.String())

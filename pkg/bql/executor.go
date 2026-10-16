@@ -113,6 +113,8 @@ func ExecStmt(ctx *ExecContext, stmt Statement) (*Result, error) {
 		return execGet(ctx, branch, s)
 	case *CreateStmt:
 		return execCreate(ctx, branch, s)
+	case *CreateIndexStmt:
+		return execCreateIndex(ctx, s)
 	case *UpdateStmt:
 		return execUpdate(ctx, branch, s)
 	case *DeleteStmt:
@@ -190,7 +192,7 @@ func indexedEq(filters []Filter) (field string, value uint64, ok bool) {
 func snapPoint(snap *engine.Snapshot, filters []Filter, h int) ([]*engine.Record, bool) {
 	field, n, ok := indexedEq(filters)
 	if !ok {
-		return nil, false
+		return snapAttr(snap, filters, h)
 	}
 	switch field {
 	case "id":
@@ -209,6 +211,33 @@ func snapPoint(snap *engine.Snapshot, filters []Filter, h int) ([]*engine.Record
 		}
 		return snap.Children(h-1, n), true
 	}
+}
+
+// snapAttr resolves the first equality filter that has a secondary hash
+// index. Remaining filters still run through filterRecords. A false return
+// means no indexed attribute matched, so the caller scans.
+func snapAttr(snap *engine.Snapshot, filters []Filter, h int) ([]*engine.Record, bool) {
+	for _, f := range filters {
+		if f.Op != OpEq {
+			continue
+		}
+		switch strings.ToLower(f.Field) {
+		case "id", "slot", "parent":
+			continue
+		}
+		ids, ok := snap.IDsByAttr(h, f.Field, f.Value)
+		if !ok {
+			continue
+		}
+		out := make([]*engine.Record, 0, len(ids))
+		for _, id := range ids {
+			if r, found := snap.Record(h, id); found {
+				out = append(out, r)
+			}
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // matchRef resolves a RecordRef inside a write transaction to the
@@ -248,6 +277,26 @@ func txRecords(tx *engine.WriteTx, layers []engine.Layer, h int, ref RecordRef) 
 			}
 		}
 	}
+	for _, f := range ref.Filters {
+		if f.Op != OpEq {
+			continue
+		}
+		switch strings.ToLower(f.Field) {
+		case "id", "slot", "parent":
+			continue
+		}
+		ids, ok := tx.IDsByAttr(ref.Layer, f.Field, f.Value)
+		if !ok {
+			continue
+		}
+		out := make([]*engine.Record, 0, len(ids))
+		for _, id := range ids {
+			if r, found := tx.Record(ref.Layer, id); found {
+				out = append(out, r)
+			}
+		}
+		return out, nil
+	}
 	return tx.Records(ref.Layer)
 }
 
@@ -273,6 +322,10 @@ func applyMutationMods(recs []*engine.Record, mods MutationModifiers) []*engine.
 // execGet runs a path traversal (zero join) over an immutable MVCC
 // snapshot. Steps filter as they walk; the final step projects
 // attribute columns and applies limit/sort to the result.
+//
+// A limit on a layer scan stops the walk once enough records match
+// (issue #46). Sort is by id, and ids follow slot order within a layer,
+// so sort=desc walks slots backward and can stop early too.
 func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	if len(s.Path) == 0 {
 		return nil, fmt.Errorf("bql: GET requires a starting layer")
@@ -286,46 +339,46 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := snap.ReadErr(); err != nil {
+		return nil, err
+	}
 	heights := map[string]int{}
 	for _, l := range snap.Layers() {
 		heights[l.Name] = l.Height
 	}
-	first := s.Path[0]
-	h, ok := heights[first.Layer]
-	if !ok {
-		return nil, fmt.Errorf("bql: unknown layer %q", first.Layer)
-	}
-	var base []*engine.Record
-	if cands, point := snapPoint(snap, first.Filters, h); point {
-		base = cands
-	} else {
-		base = snap.Records(h)
-	}
-	cur, err := filterRecords(snap.Layers(), h, base, first.Filters)
-	if err != nil {
-		return nil, err
-	}
-	curHeight := h
 
-	for _, step := range s.Path[1:] {
-		stepH, ok := heights[step.Layer]
+	var cur []*engine.Record
+	curHeight := 0
+	for i, step := range s.Path {
+		h, ok := heights[step.Layer]
 		if !ok {
 			return nil, fmt.Errorf("bql: unknown layer %q", step.Layer)
 		}
-		if stepH != curHeight+1 {
+		if i > 0 && h != curHeight+1 {
 			return nil, fmt.Errorf("bql: path step %q must be the child layer of height %d (got height %d)",
-				step.Layer, curHeight, stepH)
+				step.Layer, curHeight, h)
 		}
-		var next []*engine.Record
-		for _, r := range cur {
-			next = append(next, snap.Children(curHeight, r.ID)...)
+		final := i == len(s.Path)-1
+		var matched []*engine.Record
+		if i == 0 {
+			matched, err = matchStep(snap, h, step, final)
+		} else if final && step.Modifiers.Limit > 0 && step.Modifiers.Sort == "" {
+			matched, err = takeChildren(snap, curHeight, cur, h, step.Filters, step.Modifiers.Limit)
+		} else {
+			var next []*engine.Record
+			for _, r := range cur {
+				next = append(next, snap.Children(curHeight, r.ID)...)
+			}
+			matched, err = filterRecords(snap.Layers(), h, next, step.Filters)
+			if err == nil && final {
+				matched = orderRecords(matched, step.Modifiers.Sort, step.Modifiers.Limit)
+			}
 		}
-		next, err = filterRecords(snap.Layers(), stepH, next, step.Filters)
 		if err != nil {
 			return nil, err
 		}
-		cur = next
-		curHeight = stepH
+		cur = matched
+		curHeight = h
 	}
 
 	final := s.Path[len(s.Path)-1]
@@ -342,23 +395,14 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 		}
 		rows = append(rows, row)
 	}
+	if err := snap.ReadErr(); err != nil {
+		return nil, err
+	}
 	var fields []string
 	if len(final.Project) > 0 {
 		fields = projectFields(finalLayer, final.Project)
 	} else {
 		fields = attrFields(finalLayer.Attrs, rows)
-	}
-	if final.Modifiers.Sort != "" {
-		asc := final.Modifiers.Sort == "asc"
-		sort.SliceStable(rows, func(i, j int) bool {
-			if asc {
-				return rows[i].ID < rows[j].ID
-			}
-			return rows[i].ID > rows[j].ID
-		})
-	}
-	if n := final.Modifiers.Limit; n > 0 && len(rows) > n {
-		rows = rows[:n]
 	}
 	return &Result{
 		Columns: recordColumns,
@@ -366,6 +410,103 @@ func execGet(ctx *ExecContext, branch string, s *GetStmt) (*Result, error) {
 		Rows:    rows,
 		Message: fmt.Sprintf("%d record(s) on branch %q", len(rows), branch),
 	}, nil
+}
+
+// matchStep resolves the first step of a GET. A limited scan of the
+// whole layer stops after enough matches; an indexed point lookup stays
+// on the small candidate set.
+func matchStep(snap *engine.Snapshot, h int, step GetStep, final bool) ([]*engine.Record, error) {
+	mods := step.Modifiers
+	if cands, point := snapPoint(snap, step.Filters, h); point {
+		matched, err := filterRecords(snap.Layers(), h, cands, step.Filters)
+		if err != nil {
+			return nil, err
+		}
+		if final {
+			matched = orderRecords(matched, mods.Sort, mods.Limit)
+		}
+		return matched, nil
+	}
+	if final && mods.Limit > 0 {
+		matched, err := scanLimited(snap, h, step.Filters, mods.Limit, mods.Sort == "desc")
+		if err != nil {
+			return nil, err
+		}
+		// scanLimited already returned the right subset in slot or
+		// reverse-slot order. orderRecords makes sort=asc/desc stable
+		// without pulling in records the scan did not visit.
+		return orderRecords(matched, mods.Sort, mods.Limit), nil
+	}
+	matched, err := filterRecords(snap.Layers(), h, snap.Records(h), step.Filters)
+	if err != nil {
+		return nil, err
+	}
+	if final {
+		matched = orderRecords(matched, mods.Sort, mods.Limit)
+	}
+	return matched, nil
+}
+
+// scanLimited walks a layer in slot order (or reverse, for sort=desc)
+// and stops after limit matches.
+func scanLimited(snap *engine.Snapshot, h int, filters []Filter, limit int, reverse bool) ([]*engine.Record, error) {
+	layers := snap.Layers()
+	var out []*engine.Record
+	var ferr error
+	snap.Walk(h, reverse, func(r *engine.Record) bool {
+		for _, f := range filters {
+			ok, err := evalFilter(layers[h], r, f)
+			if err != nil {
+				ferr = err
+				return false
+			}
+			if !ok {
+				return true
+			}
+		}
+		out = append(out, r)
+		return len(out) < limit
+	})
+	if ferr != nil {
+		return nil, ferr
+	}
+	return out, nil
+}
+
+// takeChildren collects matching children of parents and stops once limit
+// rows are in hand. With no sort, parent order then child slot order is
+// the result order, so the rest of the layer does not need to be read.
+func takeChildren(snap *engine.Snapshot, parentH int, parents []*engine.Record, childH int, filters []Filter, limit int) ([]*engine.Record, error) {
+	var out []*engine.Record
+	layers := snap.Layers()
+	for _, p := range parents {
+		matched, err := filterRecords(layers, childH, snap.Children(parentH, p.ID), filters)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, matched...)
+		if len(out) >= limit {
+			return out[:limit], nil
+		}
+	}
+	return out, nil
+}
+
+// orderRecords sorts by id when asked and then applies limit.
+func orderRecords(recs []*engine.Record, sortOrder string, limit int) []*engine.Record {
+	if sortOrder != "" {
+		asc := sortOrder == "asc"
+		sort.SliceStable(recs, func(i, j int) bool {
+			if asc {
+				return recs[i].ID < recs[j].ID
+			}
+			return recs[i].ID > recs[j].ID
+		})
+	}
+	if limit > 0 && len(recs) > limit {
+		recs = recs[:limit]
+	}
+	return recs
 }
 
 // filterRecords drops records that fail any filter of the step.
@@ -550,6 +691,13 @@ func projectAttrs(layer engine.Layer, r *engine.Record, proj []AttrRef) ([]strin
 		out = append(out, r.Attrs[idx])
 	}
 	return out, nil
+}
+
+func execCreateIndex(ctx *ExecContext, s *CreateIndexStmt) (*Result, error) {
+	if err := ctx.DB.CreateIndex(s.Layer, s.Attr); err != nil {
+		return nil, err
+	}
+	return &Result{Message: fmt.Sprintf("indexed %s(%s)", s.Layer, s.Attr)}, nil
 }
 
 // execCreate creates one or more records (one assignment bracket per
@@ -809,7 +957,7 @@ func execShow(ctx *ExecContext, branch string, s *ShowStmt) (*Result, error) {
 				continue
 			}
 			res.Rows = append(res.Rows, Row{Cells: []string{
-				fmt.Sprintf("%d", l.Height), l.Name, strings.Join(l.Attrs, ", "),
+				fmt.Sprintf("%d", l.Height), l.Name, l.SchemaAttrs(),
 			}})
 		}
 		if s.Layer != "" && len(res.Rows) == 0 {

@@ -12,7 +12,10 @@ COPY --from=build /out/basald /usr/local/bin/basald
 COPY --from=build /out/basal  /usr/local/bin/basal
 USER basal
 WORKDIR /data
-# Cloud Run injects PORT; basald also accepts -addr.
+# Listens on every interface, so the process refuses to start until
+# BASAL_TOKEN is set (or you add -insecure-no-auth for a private network).
+# Cloud Run injects PORT; pass no -addr and basald binds 0.0.0.0:$PORT.
+# Commits are fsynced unless you pass -sync=false.
 EXPOSE 8080
 VOLUME ["/data"]
-ENTRYPOINT ["basald", "-file", "/data/basal.bsl", "-addr", ":8080"]
+ENTRYPOINT ["basald", "-file", "/data/basal.bsl", "-addr", "0.0.0.0:8080"]

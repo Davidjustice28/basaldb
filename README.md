@@ -52,20 +52,22 @@ for full walkthroughs. BasalDB also works for any other data that nests
 > branches and the audit log work, but the file format and query language
 > may still change. Don't use it for data you can't afford to lose. Known
 > risks, fix first:
-> - **An attribute value over 64 KB, or more than 65,535 children under one
->   record, commits without error but makes the file unopenable**
->   ([#44](https://github.com/Davidjustice28/basaldb/issues/44)). Keep values
->   small until this is fixed.
 > - **Don't let several processes write to the same file at once**: writes
 >   can be lost silently ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
->   Use one writer, or route writes through `basald`.
-> - The whole database is held in RAM, at about 2–3× the data size
->   ([#37](https://github.com/Davidjustice28/basaldb/issues/37)).
+>   Use one writer, or route writes through `basald`. `basald` queues
+>   concurrent requests on the same branch, so those writers don't have
+>   to retry 409s themselves.
+> - Slotted pages load on demand into a bounded cache (default 64MB,
+>   `-max-memory` on `basal query` / `inspect` and `basald`). The id
+>   index, and any secondary indexes, stay in memory. A single attribute
+>   can still be up to 4 GiB, and reading that record pulls the whole
+>   value into the cache.
 >
 > **Performance:** path recall, id lookups and subtree deletes run in
 > microseconds to about a millisecond at 250k–500k records in-process.
-> Lookups by attribute value are full scans until
-> [#45](https://github.com/Davidjustice28/basaldb/issues/45) lands. See
+> Equality on an indexed attribute (`url!` at init, or
+> `CREATE INDEX ON Pages(url)`) is a hash lookup. Other attribute
+> filters still scan the layer. See
 > [BENCHMARKS.md](BENCHMARKS.md), the issues labeled
 > [`priority: high`](https://github.com/Davidjustice28/basaldb/labels/priority%3A%20high),
 > and the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42).
@@ -366,7 +368,8 @@ Kim	kim@globex.io
 `basald` serves the same BQL over HTTP:
 
 ```console
-$ basald -file acme.bsl -addr :8080
+$ basald -file acme.bsl
+# listens on 127.0.0.1:8080, fsyncs each commit
 
 $ curl -G localhost:8080/v1/query --data-urlencode 'q=GET Accounts[name="Acme Corp"] -> Teams -> Users[name,email]'
 {"columns":[...],"rows":[{"layer":"Users","id":6,"parent":3,"attrs":["Sam","sam@acme.io"]}, ...]}
@@ -377,9 +380,15 @@ $ curl -X POST localhost:8080/v1/execute -H 'content-type: application/json' -d 
   }'
 ```
 
+A bind outside localhost (`-addr 0.0.0.0:8080`, or `PORT` on Cloud Run)
+refuses to start until `BASAL_TOKEN` is set. Send it as
+`Authorization: Bearer …`. `/v1/health` stays open. See
+[CLI.md](CLI.md#rest-api-basald).
+
 Endpoints: `/v1/health`, `/v1/meta`, `/v1/query` (reads only),
 `/v1/execute` (writes), `/v1/branches`, `/v1/commits`. Add `?branch=NAME`
-to read from a branch. See [CLI.md](CLI.md#rest-api-basald).
+or `"branch"` in the JSON body to use a branch. Concurrent
+`/v1/execute` calls on one branch are queued.
 
 > Run **either** `basald` **or** CLI writes against a file, not both at
 > once ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
@@ -478,11 +487,12 @@ cascade deleted 4 record(s) under 1 root(s) in "Users"
   BasalDB record `id`; BasalDB holds the structure and provenance. Native
   RAG search scoped to a subtree is planned in
   [#49](https://github.com/Davidjustice28/basaldb/issues/49).
-- **Keep large bodies out of records.** Store page HTML or long
-  transcripts in files and keep the path, hash and analysis in BasalDB.
-  Values over 64 KB currently corrupt the file
-  ([#44](https://github.com/Davidjustice28/basaldb/issues/44)); blob
-  attributes are planned in [#50](https://github.com/Davidjustice28/basaldb/issues/50).
+- **Large bodies fit, and reading one loads that page.** An attribute
+  can be up to 4 GiB and a record can have up to 2^32−1 children. The
+  page cache (default 64MB, `-max-memory`) holds recently read pages;
+  the id index stays resident. Blob attributes, stored out of line, are
+  planned in
+  [#50](https://github.com/Davidjustice28/basaldb/issues/50).
 - **Use branches for speculative memory.** Let an agent write
   "hypotheses" on a branch and keep only what's confirmed.
 
