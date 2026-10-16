@@ -49,28 +49,47 @@ for full walkthroughs. BasalDB also works for any other data that nests
 (SaaS tenants, design canvases, game state); see [Where BasalDB fits](#where-basaldb-fits).
 
 > **Status: early / experimental.** Create, query, update, cascade delete,
-> branches and the audit log work, but the file format and query language
-> may still change. Don't use it for data you can't afford to lose. Known
-> risks, fix first:
+> branches, equality indexes and the audit log work. The file format and
+> query language may still change. Don't use it for data you can't afford
+> to lose.
+>
+> **Where it stands** (2026-10-16, Apple M3 Pro, in-process, 1.05M
+> records; details in [BENCHMARKS.md](BENCHMARKS.md)):
+>
+> - **Ingest** is about 106k records/s with no secondary index. A hash
+>   index on a unique attribute (`email!`, one value per user) dropped
+>   that to 7.8k records/s. Index attributes you look up and that repeat,
+>   such as `status` or `role`. A unique index over a million values is
+>   resident and expensive to build.
+> - **Open** of that unindexed file is 78 ms, and peak RSS during ingest
+>   is 0.9 GB. With `email!` those become 315 ms and 2.0 GB. Page bodies
+>   sit in a 64MB cache (`-max-memory`). The id index, and every
+>   secondary index, stay in memory, so open time and RAM still grow
+>   with the number of records.
+> - **Reads.** A cached point read is about 1 µs, whether by id or by an
+>   indexed attribute. The first touch of a page is about 250 µs. The
+>   same `email=` lookup with no index is 280 ms. Other filters still
+>   scan the layer.
+> - **Writes** stay flat: a create is about 12 µs, and deleting a
+>   211-record account is under 1 ms.
+> - **A branch copies pages.** One branch plus one update grew the
+>   unindexed file from 166 MB to 283 MB
+>   ([#36](https://github.com/Davidjustice28/basaldb/issues/36)).
+>
+> Known risks, fix first:
 > - **Don't let several processes write to the same file at once**: writes
 >   can be lost silently ([#4](https://github.com/Davidjustice28/basaldb/issues/4)).
 >   Use one writer, or route writes through `basald`. `basald` queues
 >   concurrent requests on the same branch, so those writers don't have
 >   to retry 409s themselves.
-> - Slotted pages load on demand into a bounded cache (default 64MB,
->   `-max-memory` on `basal query` / `inspect` and `basald`). The id
->   index, and any secondary indexes, stay in memory. A single attribute
->   can still be up to 4 GiB, and reading that record pulls the whole
->   value into the cache.
+> - A single attribute can still be up to 4 GiB, and reading that record
+>   pulls the whole value into the cache.
 >
-> **Performance:** path recall, id lookups and subtree deletes run in
-> microseconds to about a millisecond at 250k–500k records in-process.
-> Equality on an indexed attribute (`url!` at init, or
-> `CREATE INDEX ON Pages(url)`) is a hash lookup. Other attribute
-> filters still scan the layer. See
-> [BENCHMARKS.md](BENCHMARKS.md), the issues labeled
-> [`priority: high`](https://github.com/Davidjustice28/basaldb/labels/priority%3A%20high),
-> and the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42).
+> The targets on the [scalability roadmap (#42)](https://github.com/Davidjustice28/basaldb/issues/42)
+> (10M+ records, a 10 GB file open in under 50 ms, indexed lookups under
+> 50 µs when the page is cold) are not met yet. Issues labeled
+> [`priority: high`](https://github.com/Davidjustice28/basaldb/labels/priority%3A%20high)
+> are the queue.
 
 ---
 
@@ -100,6 +119,7 @@ Full command and query-language reference: **[CLI.md](CLI.md)**.
 | Create child records | `CREATE Layer PARENT Layer[filter] [...]` | `CREATE Teams PARENT Accounts[name="Acme Corp"] [name="Sales"]` |
 | Walk down the tree | `->` between layers | `GET Accounts[id=1] -> Teams -> Users` |
 | Filter | `=`, `eq ne gt gte lt lte` (AND only) | `GET Users[age=(gte=30),role=admin]` |
+| Equality index | `email!` at init, or `CREATE INDEX` | `GET Users[email="sam@acme.io"]` |
 | Pick columns | first bracket | `GET Users[name,email]` |
 | Limit and sort by id | last bracket | `GET Users[*][limit=10,sort=desc]` |
 | Update attributes | `UPDATE Layer[filter][...]` | `UPDATE Users[email="sam@acme.io"][role="owner"]` |

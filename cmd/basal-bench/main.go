@@ -4,6 +4,7 @@
 // storage cost. See BENCHMARKS.md for baseline numbers.
 //
 //	go run ./cmd/basal-bench -accounts 1000 -teams 10 -users 20
+//	go run ./cmd/basal-bench -accounts 5000 -teams 10 -users 20 -index email
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +64,7 @@ func main() {
 	teams := flag.Int("teams", 10, "")
 	users := flag.Int("users", 20, "")
 	path := flag.String("file", "bench.bsl", "")
+	indexList := flag.String("index", "", "comma-separated attribute names to hash-index, e.g. email")
 	flag.Parse()
 	if *accts**teams < 300 {
 		fmt.Fprintln(os.Stderr, "basal-bench: need accounts*teams >= 300")
@@ -69,9 +72,26 @@ func main() {
 	}
 	os.Remove(*path)
 	total := *accts + *accts**teams + *accts**teams**users
+	indexed := map[string]bool{}
+	for _, name := range strings.Split(*indexList, ",") {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" {
+			indexed[name] = true
+		}
+	}
+	mark := func(name string) string {
+		if indexed[strings.ToLower(name)] {
+			return name + "!"
+		}
+		return name
+	}
+	spec := fmt.Sprintf("0:Accounts(%s,%s,%s),1:Teams(%s),2:Users(%s,%s,%s,%s)",
+		mark("name"), mark("plan"), mark("region"), mark("name"),
+		mark("name"), mark("email"), mark("role"), mark("age"))
 	fmt.Printf("== dataset: %d accounts x %d teams x %d users = %d records\n", *accts, *teams, *users, total)
+	fmt.Printf("== schema: %s\n", spec)
 
-	layers, err := engine.ParseLayers("0:Accounts(name,plan,region),1:Teams(name),2:Users(name,email,role,age)")
+	layers, err := engine.ParseLayers(spec)
 	must(err)
 	meta := engine.TxMeta{Author: "bench", Summary: "init", Reason: "benchmark"}
 	db, err := engine.Init(*path, layers, meta)
@@ -123,7 +143,26 @@ func main() {
 	fmt.Println("\n[reads] via BQL, in-process")
 	lat("GET Accounts[id=N]", 200, func(i int) { q(fmt.Sprintf("GET Accounts[id=%d]", acctIDs[rng.Intn(len(acctIDs))])) })
 	lat("GET Users[id=N]  (scans whole layer)", 50, func(i int) { q(fmt.Sprintf("GET Users[id=%d]", userIDs[rng.Intn(len(userIDs))])) })
-	lat("GET Users[email=X] (attr lookup)", 50, func(i int) { q(`GET Users[email="u5.5.5@ex.io"]`) })
+	const oneEmail = `GET Users[email="u5.5.5@ex.io"]`
+	if indexed["email"] {
+		s := time.Now()
+		q(oneEmail)
+		fmt.Printf("  GET Users[email=X] first lookup (cold page): %v\n", time.Since(s).Round(time.Microsecond))
+	}
+	lat("GET Users[email=X] (attr lookup)", 50, func(i int) { q(oneEmail) })
+	if indexed["email"] {
+		step := len(userIDs) / 50
+		if step < 1 {
+			step = 1
+		}
+		span := *teams * *users
+		lat("GET Users[email=distinct] (indexed)", 50, func(i int) {
+			idx := i * step
+			a := idx / span
+			rem := idx % span
+			q(fmt.Sprintf(`GET Users[email="u%d.%d.%d@ex.io"]`, a, rem / *users, rem%*users))
+		})
+	}
 	var n int
 	lat("GET Accounts[id=N] -> Teams -> Users (subtree)", 200, func(i int) {
 		n = len(q(fmt.Sprintf("GET Accounts[id=%d] -> Teams -> Users", acctIDs[rng.Intn(len(acctIDs))])).Rows)

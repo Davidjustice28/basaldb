@@ -8,7 +8,12 @@ Progress is tracked in the [scalability roadmap (#42)](https://github.com/Davidj
 
 ```console
 $ go run ./cmd/basal-bench -accounts 1000 -teams 10 -users 20 -file /tmp/bench.bsl
+$ go run ./cmd/basal-bench -accounts 5000 -teams 10 -users 20 -index email -file /tmp/bench.bsl
 ```
+
+`-index` is a comma-separated list of attribute names to hash-index
+(`email` marks `Users.email`). The default schema has no secondary
+indexes, which is what the tables below compare against.
 
 The benchmark creates `Accounts(name,plan,region) -> Teams(name) ->
 Users(name,email,role,age)` with the given fan-out. It loads one
@@ -217,7 +222,37 @@ again. The harness still prints `cold open (load whole file)` and
 | File size, before → after branch + 1 update | 0.9 → 1.5 MB | 32.6 → 55.6 MB | 166.0 → 283.2 MB |
 
 Branch page duplication (#36) is unchanged. These runs do not declare
-`email!`, so they do not measure secondary indexes (#45).
+`email!`. The next section does.
+
+## Update: 2026-10-16 — `email!` on the 1.05M bench
+
+Same machine and fan-out, schema
+`Users(name,email!,role,age)`. Run with
+`basal-bench -accounts 5000 -teams 10 -users 20 -index email`.
+Every email is unique, so the index holds one entry per user.
+
+| | no secondary index | `email!` |
+|---|---|---|
+| Bulk load | 9.9 s (106k rec/s) | 2 m 15 s (7.8k rec/s) |
+| File after checkpoint | 166 MB (157 B/rec) | 197 MB (187 B/rec) |
+| Heap after load | 120 MB | 384 MB |
+| Peak RSS | 922 MB | 2.0 GB |
+| Cold open | 78 ms | 315 ms |
+| `GET Users[email=X]`, same value, page cached | 280 ms (scan) | 1 µs p50 |
+| `GET Users[email=X]`, first lookup | | 265 µs |
+| `GET Users[email=distinct]`, 50 different values | | 252 µs p50 |
+| `CREATE` p50 | 12 µs | 15 µs |
+
+A repeated lookup of one indexed email is 1 µs once its page is in the
+cache. A different email faults a page and costs about the same 250 µs
+as `GET Users[id]`. The 50 µs target holds for a hot page and does not
+hold for a cold one.
+
+The load target (slow down by at most ~20% for one index) does not hold
+for this index. Building and keeping a million unique keys cut ingest
+from 106k to 7.8k records/s and made open and RAM worse, because that
+index stays resident next to the id index. A low-cardinality attribute
+was not measured.
 
 ## What the numbers say
 
@@ -243,9 +278,11 @@ Branch page duplication (#36) is unchanged. These runs do not declare
 
 **Today:** a single writer, through `basald` or the Go packages, handles
 about 1M records with ~10 µs creates and indexed id lookups that fault
-one page (~240 µs when that page is not cached). Unindexed attribute
-scans still read the layer, and they re-read it when the file is larger
-than the page cache. See
+one page (~240 µs when that page is not cached). An equality index on a
+hot page is 1 µs; the same lookup on a cold page is ~250 µs, and a
+unique index over 1M values cuts ingest to 7.8k records/s. Unindexed
+attribute scans still read the layer, and they re-read it when the file
+is larger than the page cache. See
 [#42](https://github.com/Davidjustice28/basaldb/issues/42) for the plan
 and targets (10M+ records, ≥100k records/s ingest, <50 µs indexed
 lookups, bounded RAM).
