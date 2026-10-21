@@ -450,6 +450,68 @@ With `-index email` at 211k: load 4.3 s, peak RSS 509 MB, file
 - **`-index email` ingest** at 1.05M is slower than the old binary
   (1 m 47 s against 75 s) and triples peak RSS.
 
+## Comparison: BasalDB vs SQLite, 2026-10-21
+
+Same workload, dataset and seed as `basal-bench`, run against SQLite
+3 (via `mattn/go-sqlite3` v1.14.24) by
+[`bench/sqlite-compare`](bench/sqlite-compare/README.md). SQLite gets
+its best normal setup: WAL, foreign keys with every parent column
+indexed, `ANALYZE` after the load, and statements prepared once. BQL
+parses every query. Writes without fsync use `synchronous=OFF`, as
+`basal-bench` appends without fsync. The fsync row uses
+`synchronous=FULL` with `fullfsync`, matching Go's `F_FULLFSYNC`.
+
+BasalDB is `e69a227` plus the page-cache fix in #60. Apple M3 Pro, Go
+1.27.2, medians of 3 runs. The machine was **busy** (load average
+5–13), so treat absolute numbers as upper bounds. Ratios are BasalDB
+against SQLite; **bold** marks where BasalDB wins.
+
+### Where BasalDB wins
+
+| | 5.6k | 211k | 1.05M |
+|---|---|---|---|
+| Branch create (SQLite: copy the file) | **47 µs vs 398 µs** | **31 µs vs 13 ms** | **29 µs vs 63 ms** |
+| Subtree: account → teams → users | **7 vs 47 µs** | **22 vs 185 µs** | 281 vs 186 µs |
+| Parallel subtree reads, 12 goroutines | **211k vs 77k q/s** | **122k vs 16k q/s** | 16k vs 25k q/s |
+| `GET Accounts[id=N]` (root layer) | **1 vs 3 µs** | **1 vs 3 µs** | **1 vs 4 µs** |
+| CREATE with fsync | 3.0 vs 1.8 ms | 3.0 vs 3.0 ms | **1.6 vs 2.9 ms** |
+
+At 1.05M the data no longer fits the 64 MB page cache and BasalDB
+subtree reads become page loads (#65). SQLite reads from the OS page
+cache and keeps its lead there.
+
+### Where SQLite wins
+
+| | 211k | 1.05M |
+|---|---|---|
+| File size | 32.5 vs 12.4 MB (2.6×) | 166 vs 64.5 MB (2.6×) |
+| Peak RSS | 218 vs 50 MB (4.3×) | 872 vs 61 MB (14×) |
+| Bulk load | 0.93 vs 0.38 s (2.5×) | 7.3 vs 1.9 s (3.8×) |
+| Cold open | 11 vs 1 ms | 48 vs 1 ms |
+| `GET Users[id=N]` (non-root layer) | 264 vs 6 µs (44×) | 269 vs 7 µs (38×) |
+| `GET Users[email=X]`, no index | 9.9 vs 6.8 ms | 337 vs 38 ms (9×) |
+| `GET Users[age=(gt=60),role=admin]` | 17.2 vs 7.9 ms | 383 vs 42 ms (9×) |
+| `UPDATE Users[id=N]` | 14 vs 7 µs | 29 vs 8 µs |
+| Delete one account (cascade) | 448 vs 140 µs | 965 vs 151 µs (6×) |
+
+`CREATE` is about even (14–21 µs against 13–18 µs). With a unique
+email index at 1.05M, both look up an email in 1–4 µs, but BasalDB's
+ingest takes 119 s against 2.6 s, and its peak RSS is 2.5 GB against
+61 MB (#64).
+
+`GET Users[id=N]` taking 264 µs on a 211k file that fits in cache is
+worth a look. A child-layer id lookup costs about the same as a page
+load, while a root-layer lookup costs 1 µs.
+
+### Reading this
+
+- Use BasalDB for its model: cheap branches, tree-shaped reads in one
+  query, and per-commit provenance. Up to a few hundred thousand
+  records it is also faster than SQLite for those reads.
+- It is not a general replacement for SQLite. Scans, storage,
+  memory, ingest and cascade deletes are 2–14× behind, and indexed
+  ingest much further.
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
