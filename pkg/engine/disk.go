@@ -198,7 +198,16 @@ type cacheEntry struct {
 
 // pageCache is a process-local LRU of decoded pages, keyed by file
 // generation so a checkpoint cannot alias a page from the previous inode.
+// It is split into shards with their own locks so parallel readers do not
+// queue on one mutex. Each shard holds an equal slice of the budget, so
+// eviction is LRU per shard rather than global.
 type pageCache struct {
+	shards atomic.Pointer[[]*cacheShard]
+	mu     sync.Mutex // serializes setMax and dropGen
+	max    int
+}
+
+type cacheShard struct {
 	mu   sync.Mutex
 	max  int
 	used int
@@ -206,34 +215,84 @@ type pageCache struct {
 	m    map[cacheKey]*list.Element
 }
 
+const (
+	maxCacheShards = 16
+	minShardBudget = 2 << 20 // keep room for several pages per shard
+)
+
 func newPageCache(max int) *pageCache {
+	c := &pageCache{}
+	c.mu.Lock()
+	c.resize(max)
+	c.mu.Unlock()
+	return c
+}
+
+// shardCount picks fewer shards for small budgets so a single shard can
+// still hold whole pages.
+func shardCount(max int) int {
+	n := max / minShardBudget
+	if n < 1 {
+		return 1
+	}
+	if n > maxCacheShards {
+		return maxCacheShards
+	}
+	return n
+}
+
+// resize applies a new budget. Callers hold c.mu. Changing the shard
+// count starts an empty cache; pages are reloaded on demand.
+func (c *pageCache) resize(max int) {
 	if max <= 0 {
 		max = DefaultCacheBytes
 	}
-	return &pageCache{max: max, ll: list.New(), m: map[cacheKey]*list.Element{}}
+	c.max = max
+	n := shardCount(max)
+	per := max / n
+	if cur := c.shards.Load(); cur != nil && len(*cur) == n {
+		for _, sh := range *cur {
+			sh.mu.Lock()
+			sh.max = per
+			sh.evict()
+			sh.mu.Unlock()
+		}
+		return
+	}
+	shards := make([]*cacheShard, n)
+	for i := range shards {
+		shards[i] = &cacheShard{max: per, ll: list.New(), m: map[cacheKey]*list.Element{}}
+	}
+	c.shards.Store(&shards)
 }
 
 func (c *pageCache) setMax(n int) {
 	if c == nil {
 		return
 	}
-	if n <= 0 {
-		n = DefaultCacheBytes
-	}
 	c.mu.Lock()
-	c.max = n
-	c.evict()
+	c.resize(n)
 	c.mu.Unlock()
 }
 
+func (c *pageCache) shard(key cacheKey) *cacheShard {
+	shards := *c.shards.Load()
+	if len(shards) == 1 {
+		return shards[0]
+	}
+	h := (key.idx*0x9E3779B97F4A7C15 ^ uint64(key.layer)*0xC2B2AE3D27D4EB4F) >> 32
+	return shards[h%uint64(len(shards))]
+}
+
 func (c *pageCache) get(key cacheKey) (*Page, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	el, ok := c.m[key]
+	sh := c.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	el, ok := sh.m[key]
 	if !ok {
 		return nil, false
 	}
-	c.ll.MoveToFront(el)
+	sh.ll.MoveToFront(el)
 	return el.Value.(*cacheEntry).page, true
 }
 
@@ -241,31 +300,32 @@ func (c *pageCache) put(key cacheKey, p *Page, cost int) {
 	if c == nil || p == nil || cost <= 0 {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.m[key]; ok {
-		c.ll.MoveToFront(el)
+	sh := c.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if el, ok := sh.m[key]; ok {
+		sh.ll.MoveToFront(el)
 		return
 	}
-	// A single page larger than the budget is not cached. Callers still
+	// A page larger than the shard budget is not cached. Callers still
 	// receive it; the next read decodes it again. That keeps the cap
 	// honest for -max-memory.
-	if cost > c.max {
+	if cost > sh.max {
 		return
 	}
-	el := c.ll.PushFront(&cacheEntry{key: key, page: p, cost: cost})
-	c.m[key] = el
-	c.used += cost
-	c.evict()
+	el := sh.ll.PushFront(&cacheEntry{key: key, page: p, cost: cost})
+	sh.m[key] = el
+	sh.used += cost
+	sh.evict()
 }
 
-func (c *pageCache) evict() {
-	for c.used > c.max && c.ll.Len() > 0 {
-		el := c.ll.Back()
+func (sh *cacheShard) evict() {
+	for sh.used > sh.max && sh.ll.Len() > 0 {
+		el := sh.ll.Back()
 		ent := el.Value.(*cacheEntry)
-		c.ll.Remove(el)
-		delete(c.m, ent.key)
-		c.used -= ent.cost
+		sh.ll.Remove(el)
+		delete(sh.m, ent.key)
+		sh.used -= ent.cost
 	}
 }
 
@@ -275,14 +335,18 @@ func (c *pageCache) dropGen(g *fileGen) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for key, el := range c.m {
-		if key.gen != g {
-			continue
+	for _, sh := range *c.shards.Load() {
+		sh.mu.Lock()
+		for key, el := range sh.m {
+			if key.gen != g {
+				continue
+			}
+			ent := el.Value.(*cacheEntry)
+			sh.ll.Remove(el)
+			delete(sh.m, key)
+			sh.used -= ent.cost
 		}
-		ent := el.Value.(*cacheEntry)
-		c.ll.Remove(el)
-		delete(c.m, key)
-		c.used -= ent.cost
+		sh.mu.Unlock()
 	}
 }
 

@@ -647,8 +647,22 @@ func (mv *matrixView) Children(layer int, id uint64) []*Record {
 		return nil
 	}
 	out := make([]*Record, 0, len(rec.Children))
+	// Siblings usually share a page, so resolve each page once instead of
+	// once per child. Every page fetch is a trip through the shared cache.
+	var cur *Page
+	curIdx, have := uint64(0), false
 	for _, c := range rec.Children {
-		if r := ls.record(c); r != nil {
+		x, ok := ls.slotOf(c)
+		if !ok {
+			continue
+		}
+		if idx := x / SlotsPerPage; !have || idx != curIdx {
+			cur, curIdx, have = ls.page(idx), idx, true
+		}
+		if cur == nil {
+			continue
+		}
+		if r := cur.Get(x); r != nil {
 			out = append(out, r)
 		}
 	}
