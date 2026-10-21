@@ -323,6 +323,133 @@ A long commit log still adds open time and RAM. A cold id lookup is
 still one data-page fault: 2.8 ms on the first touch of the 14 GB
 file, and about 250 µs at 1.05M in the quiet run above.
 
+## Update: 2026-10-20 — rerun at `e69a227`, CLI per call
+
+Apple M3 Pro (12 cores, 18 GB), Go 1.27.2, `/usr/bin/time -l`. The
+machine was **busy** (load average 6.6–8, another process using about
+one core), so treat latencies as upper bounds. Back-to-back runs of
+`70c6b76` and `e69a227` under the same load gave the same subtree
+latency (355 µs and 296–978 µs), so the slower subtree reads below are
+load, not a regression. The 10 GiB generated file was not rerun.
+
+### Size, memory, load
+
+| | 5.6k records | 211k records | 1.05M records | 1.05M, `email!` |
+|---|---|---|---|---|
+| Bulk load | 14 ms (413k rec/s) | 908 ms (232k rec/s) | 6.2 s (170k rec/s) | 2 m 2 s (8.6k rec/s) |
+| File after checkpoint | 0.8 MB | 32.5 MB | 166.0 MB | 197.3 MB |
+| Heap after load | 5 MB | 24 MB | 81 MB | 345 MB |
+| Peak RSS | 22 MB | 199 MB | 888 MB | 2.1 GB |
+| Cold open (in-process) | <1 ms | 12 ms | 47 ms | 350 ms |
+| Checkpoint | 5 ms | 66 ms | 206 ms | 2.7 s |
+
+A second run at 1.05M loaded at 167k rec/s. The 2026-10-16 run was
+106k rec/s.
+
+### Reads and writes (BQL, in-process, p50)
+
+| | 5.6k | 211k | 1.05M | 1.05M, `email!` |
+|---|---|---|---|---|
+| `GET Accounts[id=N]` | 1 µs | 1 µs | 1 µs | 1 µs |
+| `GET Users[id=N]` | 2 µs | 277 µs | 256 µs | 273 µs |
+| `GET Users[email=X]` | 205 µs (scan) | 9.4 ms (scan) | 337 ms (scan) | 1 µs hot, 266 µs distinct |
+| subtree | 8 µs (50 rows) | 27 µs | 300 µs | 292 µs |
+| `GET Users[age=(gt=60),role=admin]` | 420 µs | 18 ms | 370 ms | 387 ms |
+| `GET Users[*][limit=10,sort=desc]` | 2 µs | 17 µs | 99 µs | 127 µs |
+| Parallel subtree reads, 12 goroutines | 51k q/s | 17k q/s | 15k q/s | 13k q/s |
+| `CREATE` | 13 µs | 19 µs | 15 µs | 15 µs |
+| `UPDATE [id=N]` | 10 µs | 13 µs | 26 µs | 22 µs |
+| Delete one account | 178 µs (63 rec) | 426 µs (211 rec) | 576 µs | 628 µs |
+| CREATE with fsync | 3.2 ms | 2.9 ms | 1.6 ms | 1.5 ms |
+| Branch + 1 update, file | 0.9 → 1.0 MB | 32.6 → 36.1 MB | 166.0 → 183.1 MB | 197.3 → 245.6 MB |
+
+With `email!`, `CREATE` p50 is 15 µs but throughput is 101 ops/s
+(fsync: 2 ops/s). A few commits cross the 8 MiB journal limit and
+checkpoint, and that checkpoint rewrites the resident unique index,
+which takes 2.7–4.7 s. The p99 over 500 writes misses those stalls.
+
+### Opening in a second process (`-open-only`, 1.05M bench file)
+
+| | first | second |
+|---|---|---|
+| Cold open | 67 ms | 55 ms |
+| Heap after open | 74 MB | 74 MB |
+| Max RSS | 150 MB | 150 MB |
+| `GET Users[id=1]` | 1.3 ms | 35 µs |
+
+### CLI (`basal query`, one process per call, `e69a227`)
+
+| | 211k records | 1.05M records |
+|---|---|---|
+| `SHOW LAYERS` | 10–20 ms | 60 ms |
+| `GET Accounts[id=N] -> Teams -> Users` | 10 ms | |
+| `GET Users[id=N]` | 10 ms | 60–70 ms |
+| `CREATE Users PARENT Teams[id=N]` | 60–80 ms | |
+
+The 2026-10-14 baseline was 250–450 ms per call at 211k, and the
+SQLite comparison was 10–23 ms. CLI reads at 211k are now in that
+range. At 1.05M most of the 60 ms is parsing the ~47 MB commit log at
+open.
+
+## Update: 2026-10-21 — `f19c089` vs `e69a227`, back to back
+
+Apple M3 Pro (12 cores, 18 GB), Go 1.27.2, `/usr/bin/time -l`. Old
+binary built at `f19c089` (the 2026-10-14 baseline code plus
+`basal-bench`), new at `e69a227`. Three rounds, each running every size
+old then new, so both saw the same load; medians below. Load average
+was 2–5 for most of the runs (a local Postgres stack in OrbStack was
+up). Rounds agreed closely, apart from one round of new subtree reads
+at 1.05M (270 µs against 35 µs).
+
+### 1.05M records (5000 × 10 × 20)
+
+| | `f19c089` | `e69a227` | `e69a227`, `-index email` |
+|---|---|---|---|
+| Bulk load | 74.9 s | 5.2 s | 1 m 47 s |
+| Heap after load | 332 MB | 81 MB | 345 MB |
+| Peak RSS | 1.7 GB | 813 MB | 2.5 GB |
+| File after checkpoint | 136.7 MB | 166.0 MB | 197.3 MB |
+| Cold open | 386 ms | 43 ms | 250 ms |
+| `GET Accounts[id=N]` | 612 µs | 1 µs | 1 µs |
+| `GET Users[id=N]` | 222 ms | 244 µs | 247 µs |
+| `GET Users[email=X]` | 233 ms | 290 ms | 1 µs |
+| subtree | 633 µs | 35 µs | 271 µs |
+| `GET Users[age=(gt=60),role=admin]` | 268 ms | 334 ms | 329 ms |
+| `GET Users[*][limit=10,sort=desc]` | 410 ms | 93 µs | 92 µs |
+| Parallel subtree reads, 12 goroutines | 12.3k q/s | 15.9k q/s | 15.8k q/s |
+| `CREATE` | 47.9 ms | 14 µs | 14 µs |
+| `UPDATE [id=N]` | 265 ms | 16 µs | 18 µs |
+| Delete one account (211 rec) | 1.39 s | 555 µs | 590 µs |
+| CREATE with fsync | 54 ms | 2.5 ms | 2.7 ms |
+| Branch + 1 update, file | → 224.7 MB | → 183.1 MB | → 245.6 MB |
+
+### 211k and 5.6k records (`f19c089` → `e69a227`)
+
+| | 5.6k | 211k |
+|---|---|---|
+| Bulk load | 15 → 19 ms | 1.99 s → 775 ms |
+| Peak RSS | 22 → 22 MB | 311 → 192 MB |
+| File after checkpoint | 0.7 → 0.8 MB | 26.7 → 32.5 MB |
+| `GET Users[email=X]` (scan) | 656 → 246 µs | 36.9 → 8.4 ms |
+| `GET Users[age=(gt=60),role=admin]` | 811 → 425 µs | 44.2 → 16.0 ms |
+| subtree | 10 → 9 µs | 115 → 24 µs |
+| Parallel subtree reads, 12 goroutines | **226k → 62k q/s** | **60k → 23k q/s** |
+| `UPDATE [id=N]` | 790 → 9 µs | 38.1 ms → 11 µs |
+
+With `-index email` at 211k: load 4.3 s, peak RSS 509 MB, file
+38.6 MB, email lookup 1 µs.
+
+### Regressions this run confirms
+
+- **Parallel subtree reads** fell 3.6× at 5.6k and 2.6× at 211k while
+  serial subtree reads got faster, so the cost is contention between
+  readers, not the walk itself. At 1.05M they are slightly faster.
+- **Unindexed scans at 1.05M** (`email=X`, the age/role filter) are
+  about 25% slower than at `f19c089`. They are faster at smaller sizes.
+- **File size** is about 21% larger than `f19c089` at every size.
+- **`-index email` ingest** at 1.05M is slower than the old binary
+  (1 m 47 s against 75 s) and triples peak RSS.
+
 ## What the numbers say
 
 - **Subtree walks are the strong point**, but their cost still grows
