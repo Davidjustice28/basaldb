@@ -611,6 +611,15 @@ user and get read, branched or forgotten as a unit → BasalDB.**
 Relational app data → SQLite or PostgreSQL. Large-scale semantic search
 → a vector database. Number crunching → DuckDB.
 
+### Against SQLite, measured
+
+Branches take about 30 µs at any size and store only the pages they
+change; with SQLite you'd copy the file (63 ms at 1M records). Reading
+a whole subtree in one query is 7–8× faster than the equivalent indexed
+SQL join, up to a few hundred thousand records. For storage size,
+memory, scans and bulk loading, SQLite is still ahead. See
+[BENCHMARKS.md](BENCHMARKS.md#comparison-basaldb-vs-sqlite-2026-10-21).
+
 ## Where BasalDB fits
 
 * **AI agent traces and memory.** Sessions → tasks → steps, or users →
