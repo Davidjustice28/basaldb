@@ -1,7 +1,9 @@
 # BasalDB architecture
 
-A short map of how BasalDB stores and serves data. For usage see the
-[README](../README.md); for the query language see [CLI.md](../CLI.md).
+A short map of how BasalDB stores and serves data. For a short
+introduction see the [README](../README.md); for capabilities, the file
+format and agent walkthroughs see [GUIDE.md](../GUIDE.md); for the query
+language see [CLI.md](../CLI.md).
 
 ## The data model: a matrix of layers
 
